@@ -93,7 +93,7 @@ public extension AudioProcessing {
     }
 
     static func padOrTrimAudio(fromArray audioArray: [Float], startAt startIndex: Int = 0, toLength frameLength: Int = 480_000, saveSegment: Bool = false) -> MLMultiArray? {
-        guard startIndex >= 0 && startIndex < audioArray.count else {
+        guard startIndex >= 0, startIndex < audioArray.count else {
             Logging.error("startIndex is outside the buffer size")
             return nil
         }
@@ -178,7 +178,6 @@ public class AudioProcessor: NSObject, AudioProcessing {
     }
 
     public var audioBufferCallback: (([Float]) -> Void)?
-    public var maxBufferLength = WhisperKit.sampleRate * WhisperKit.chunkLength // 30 seconds of audio at 16,000 Hz
     public var minBufferLength = Int(Double(WhisperKit.sampleRate) * 0.1) // 0.1 second of audio at 16,000 Hz
 
     // MARK: - Loading and conversion
@@ -229,7 +228,11 @@ public class AudioProcessor: NSObject, AudioProcessing {
             guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
                 throw WhisperError.loadAudioFailed("Unable to create audio buffer")
             }
-            try audioFile.read(into: buffer, frameCount: frameCount)
+            do {
+                try audioFile.read(into: buffer, frameCount: frameCount)
+            } catch {
+                throw WhisperError.loadAudioFailed("Failed to read audio file: \(error)")
+            }
             outputBuffer = buffer
         } else {
             // Audio needs resampling to 16khz
@@ -349,13 +352,15 @@ public class AudioProcessor: NSObject, AudioProcessing {
         }
 
         let inputBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: maxReadFrameSize)!
-
-        while audioFile.framePosition < endFramePosition {
-            let remainingFrames = AVAudioFrameCount(endFramePosition - audioFile.framePosition)
+        var nextPosition = inputStartFrame
+        while nextPosition < endFramePosition {
+            let framePosition = audioFile.framePosition
+            let remainingFrames = AVAudioFrameCount(endFramePosition - framePosition)
             let framesToRead = min(remainingFrames, maxReadFrameSize)
+            nextPosition = framePosition + Int64(framesToRead)
 
-            let currentPositionInSeconds = Double(audioFile.framePosition) / inputSampleRate
-            let nextPositionInSeconds = (Double(audioFile.framePosition) + Double(framesToRead)) / inputSampleRate
+            let currentPositionInSeconds = Double(framePosition) / inputSampleRate
+            let nextPositionInSeconds = Double(nextPosition) / inputSampleRate
             Logging.debug("Resampling \(String(format: "%.2f", currentPositionInSeconds))s - \(String(format: "%.2f", nextPositionInSeconds))s")
 
             do {
@@ -467,7 +472,7 @@ public class AudioProcessor: NSObject, AudioProcessing {
     ) -> Bool {
         // Calculate the number of energy values to consider based on the duration of the next buffer
         // Each energy value corresponds to 1 buffer length (100ms of audio), hence we divide by 0.1
-        let energyValuesToConsider = Int(nextBufferInSeconds / 0.1)
+        let energyValuesToConsider = max(0, Int(nextBufferInSeconds / 0.1))
 
         // Extract the relevant portion of energy values from the currentRelativeEnergy array
         let nextBufferEnergies = relativeEnergy.suffix(energyValuesToConsider)

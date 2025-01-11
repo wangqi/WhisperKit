@@ -13,7 +13,12 @@ import Tokenizers
 open class WhisperKit {
     /// Models
     public private(set) var modelVariant: ModelVariant = .tiny
-    public private(set) var modelState: ModelState = .unloaded
+    public private(set) var modelState: ModelState = .unloaded {
+        didSet {
+            modelStateCallback?(oldValue, modelState)
+        }
+    }
+
     public var modelCompute: ModelComputeOptions
     public var tokenizer: WhisperTokenizer?
 
@@ -24,12 +29,11 @@ open class WhisperKit {
     public var textDecoder: any TextDecoding
     public var logitsFilters: [any LogitsFiltering]
     public var segmentSeeker: any SegmentSeeking
+    public var voiceActivityDetector: VoiceActivityDetector?
 
     /// Shapes
     public static let sampleRate: Int = 16000
     public static let hopLength: Int = 160
-    public static let chunkLength: Int = 30 // seconds
-    public static let windowSamples: Int = 480_000 // sampleRate * chunkLength
     public static let secondsPerTimeToken = Float(0.02)
 
     /// Progress
@@ -41,6 +45,11 @@ open class WhisperKit {
     public var tokenizerFolder: URL?
     public private(set) var useBackgroundDownloadSession: Bool
 
+    /// Callbacks
+    public var segmentDiscoveryCallback: SegmentDiscoveryCallback?
+    public var modelStateCallback: ModelStateCallback?
+    public var transcriptionStateCallback: TranscriptionStateCallback?
+
     public init(_ config: WhisperKitConfig = WhisperKitConfig()) async throws {
         modelCompute = config.computeOptions ?? ModelComputeOptions()
         audioProcessor = config.audioProcessor ?? AudioProcessor()
@@ -49,6 +58,7 @@ open class WhisperKit {
         textDecoder = config.textDecoder ?? TextDecoder()
         logitsFilters = config.logitsFilters ?? []
         segmentSeeker = config.segmentSeeker ?? SegmentSeeker()
+        voiceActivityDetector = config.voiceActivityDetector
         tokenizerFolder = config.tokenizerFolder
         useBackgroundDownloadSession = config.useBackgroundDownloadSession
         currentTimings = TranscriptionTimings()
@@ -61,6 +71,7 @@ open class WhisperKit {
             modelFolder: config.modelFolder,
             download: config.download
         )
+        
 
         if let prewarm = config.prewarm, prewarm {
             Logging.info("Prewarming models...")
@@ -140,14 +151,22 @@ open class WhisperKit {
         return modelSupport(for: deviceName)
     }
 
-    public static func recommendedRemoteModels(from repo: String = "argmaxinc/whisperkit-coreml") async -> ModelSupport {
+    public static func recommendedRemoteModels(
+        from repo: String = "argmaxinc/whisperkit-coreml",
+        downloadBase: URL? = nil,
+        token: String? = nil
+    ) async -> ModelSupport {
         let deviceName = Self.deviceName()
-        let config = await Self.fetchModelSupportConfig(from: repo)
+        let config = await Self.fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
         return modelSupport(for: deviceName, from: config)
     }
 
-    public static func fetchModelSupportConfig(from repo: String = "argmaxinc/whisperkit-coreml") async -> ModelSupportConfig {
-        let hubApi = HubApi()
+    public static func fetchModelSupportConfig(
+        from repo: String = "argmaxinc/whisperkit-coreml",
+        downloadBase: URL? = nil,
+        token: String? = nil
+    ) async -> ModelSupportConfig {
+        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token)
         var modelSupportConfig = Constants.fallbackModelSupportConfig
 
         do {
@@ -164,8 +183,13 @@ open class WhisperKit {
         return modelSupportConfig
     }
 
-    public static func fetchAvailableModels(from repo: String = "argmaxinc/whisperkit-coreml", matching: [String] = ["*"]) async throws -> [String] {
-        let modelSupportConfig = await fetchModelSupportConfig(from: repo)
+    public static func fetchAvailableModels(
+        from repo: String = "argmaxinc/whisperkit-coreml",
+        matching: [String] = ["*"],
+        downloadBase: URL? = nil,
+        token: String? = nil
+    ) async throws -> [String] {
+        let modelSupportConfig = await fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
         let supportedModels = modelSupportConfig.modelSupport().supported
         var filteredSupportSet: Set<String> = []
         for glob in matching {
@@ -217,9 +241,10 @@ open class WhisperKit {
         downloadBase: URL? = nil,
         useBackgroundSession: Bool = false,
         from repo: String = "argmaxinc/whisperkit-coreml",
+        token: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> URL {
-        let hubApi = HubApi(downloadBase: downloadBase, useBackgroundSession: useBackgroundSession)
+        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token, useBackgroundSession: useBackgroundSession)
         let repo = Hub.Repo(id: repo, type: .models)
         let modelSearchPath = "*\(variant.description)/*"
         do {
@@ -278,10 +303,10 @@ open class WhisperKit {
             self.modelFolder = URL(fileURLWithPath: folder)
         } else if download {
             // Determine the model variant to use
-            let modelSupport = await WhisperKit.recommendedRemoteModels()
+            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
+            let modelSupport = await WhisperKit.recommendedRemoteModels(from: repo, downloadBase: downloadBase)
             let modelVariant = model ?? modelSupport.default
 
-            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
             do {
                 self.modelFolder = try await Self.download(
                     variant: modelVariant,
@@ -357,7 +382,12 @@ open class WhisperKit {
                 computeUnits: modelCompute.textDecoderCompute,
                 prewarmMode: prewarmMode
             )
-            currentTimings.decoderLoadTime = CFAbsoluteTimeGetCurrent() - decoderLoadStart
+
+            if prewarmMode {
+                currentTimings.decoderSpecializationTime = CFAbsoluteTimeGetCurrent() - decoderLoadStart
+            } else {
+                currentTimings.decoderLoadTime = CFAbsoluteTimeGetCurrent() - decoderLoadStart
+            }
 
             Logging.debug("Loaded text decoder in \(String(format: "%.2f", currentTimings.decoderLoadTime))s")
         }
@@ -371,7 +401,12 @@ open class WhisperKit {
                 computeUnits: modelCompute.audioEncoderCompute,
                 prewarmMode: prewarmMode
             )
-            currentTimings.encoderLoadTime = CFAbsoluteTimeGetCurrent() - encoderLoadStart
+
+            if prewarmMode {
+                currentTimings.encoderSpecializationTime = CFAbsoluteTimeGetCurrent() - encoderLoadStart
+            } else {
+                currentTimings.encoderLoadTime = CFAbsoluteTimeGetCurrent() - encoderLoadStart
+            }
 
             Logging.debug("Loaded audio encoder in \(String(format: "%.2f", currentTimings.encoderLoadTime))s")
         }
@@ -479,7 +514,11 @@ open class WhisperKit {
         decoderInputs.decoderKeyPaddingMask[0] = 0.0
 
         // Detect language using up to the first 30 seconds
-        guard let audioSamples = AudioProcessor.padOrTrimAudio(fromArray: audioArray, startAt: 0, toLength: WhisperKit.windowSamples) else {
+        guard let audioSamples = AudioProcessor.padOrTrimAudio(
+            fromArray: audioArray,
+            startAt: 0,
+            toLength: featureExtractor.windowSamples ?? Constants.defaultWindowSamples
+        ) else {
             throw WhisperError.transcriptionFailed("Audio samples are nil")
         }
         guard let melOutput = try await featureExtractor.logMelSpectrogram(fromAudio: audioSamples) else {
@@ -537,6 +576,8 @@ open class WhisperKit {
         decodeOptions: DecodingOptions? = nil,
         callback: TranscriptionCallback = nil
     ) async -> [Result<[TranscriptionResult], Swift.Error>] {
+        transcriptionStateCallback?(.convertingAudio)
+
         // Start timing the audio loading and conversion process
         let loadAudioStart = Date()
 
@@ -548,6 +589,11 @@ open class WhisperKit {
         let loadAndConvertTime = Date().timeIntervalSince(loadAudioStart)
         currentTimings.audioLoading = loadAndConvertTime
         Logging.debug("Total Audio Loading and Converting Time: \(loadAndConvertTime)")
+
+        transcriptionStateCallback?(.transcribing)
+        defer {
+            transcriptionStateCallback?(.finished)
+        }
 
         // Transcribe the loaded audio arrays
         let transcribeResults = await transcribeWithResults(
@@ -721,6 +767,8 @@ open class WhisperKit {
         decodeOptions: DecodingOptions? = nil,
         callback: TranscriptionCallback = nil
     ) async throws -> [TranscriptionResult] {
+        transcriptionStateCallback?(.convertingAudio)
+
         // Process input audio file into audio samples
         let audioArray = try await withThrowingTaskGroup(of: [Float].self) { group -> [Float] in
             let convertAudioStart = Date()
@@ -734,6 +782,12 @@ open class WhisperKit {
             return try AudioProcessor.loadAudioAsFloatArray(fromPath: audioPath)
         }
 
+        transcriptionStateCallback?(.transcribing)
+        defer {
+            transcriptionStateCallback?(.finished)
+        }
+
+        // Send converted samples to be transcribed
         let transcribeResults: [TranscriptionResult] = try await transcribe(
             audioArray: audioArray,
             decodeOptions: decodeOptions,
@@ -772,15 +826,15 @@ open class WhisperKit {
         var transcribeResults = [TranscriptionResult]()
 
         // Determine if the audio array requires chunking
-        let isChunkable = audioArray.count > WhisperKit.windowSamples
+        let isChunkable = audioArray.count > featureExtractor.windowSamples ?? Constants.defaultWindowSamples
         switch (isChunkable, decodeOptions?.chunkingStrategy) {
             case (true, .vad):
                 // We have some audio that will require multiple windows and a strategy to chunk them
-                let vad = decodeOptions?.voiceActivityDetector ?? EnergyVAD()
+                let vad = voiceActivityDetector ?? EnergyVAD()
                 let chunker = VADAudioChunker(vad: vad)
                 let audioChunks: [AudioChunk] = try await chunker.chunkAll(
                     audioArray: audioArray,
-                    maxChunkLength: WhisperKit.windowSamples,
+                    maxChunkLength: featureExtractor.windowSamples ?? Constants.defaultWindowSamples,
                     decodeOptions: decodeOptions
                 )
 
@@ -859,6 +913,8 @@ open class WhisperKit {
                 textDecoder: textDecoder,
                 tokenizer: tokenizer
             )
+
+            transcribeTask.segmentDiscoveryCallback = self.segmentDiscoveryCallback
 
             let transcribeTaskResult = try await transcribeTask.run(
                 audioArray: audioArray,

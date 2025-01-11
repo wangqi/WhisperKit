@@ -49,6 +49,7 @@ public extension WhisperMLModel {
 
 // MARK: - Whisper Models
 
+@frozen
 public enum ModelVariant: CustomStringConvertible, CaseIterable {
     case tiny
     case tinyEn
@@ -100,6 +101,7 @@ public enum ModelVariant: CustomStringConvertible, CaseIterable {
     }
 }
 
+@frozen
 public enum ModelState: CustomStringConvertible {
     case unloading
     case unloaded
@@ -127,7 +129,7 @@ public enum ModelState: CustomStringConvertible {
             case .downloading:
                 return "Downloading"
             case .downloaded:
-                return "Downloading"
+                return "Downloaded"
         }
     }
 }
@@ -282,7 +284,8 @@ public struct AudioChunk {
 
 // MARK: - Decoding
 
-public enum DecodingTask: CustomStringConvertible, CaseIterable {
+@frozen
+public enum DecodingTask: Codable, CustomStringConvertible, CaseIterable {
     case transcribe
     case translate
 
@@ -296,7 +299,7 @@ public enum DecodingTask: CustomStringConvertible, CaseIterable {
     }
 }
 
-public struct DecodingInputs {
+open class DecodingInputs {
     public var initialPrompt: [Int]
     public var inputIds: MLMultiArray
     public var cacheLength: MLMultiArray
@@ -355,7 +358,8 @@ public struct DecodingCache {
     }
 }
 
-public enum ChunkingStrategy: String, CaseIterable {
+@frozen
+public enum ChunkingStrategy: String, Codable, CaseIterable {
     case none
     case vad
 }
@@ -444,6 +448,7 @@ public struct DecodingResult {
     }
 }
 
+@frozen
 public enum WhisperError: Error, LocalizedError, Equatable {
     case tokenizerUnavailable(String = "Tokenizer is unavailable")
     case modelsUnavailable(String = "Models are unavailable")
@@ -575,6 +580,7 @@ public struct TranscriptionResult: Codable {
         Total Tokens:                  \(totalTokens)
         Tokens per Second:             \(String(format: "%.2f", tokensPerSecond)) tok/s
         Real Time Factor:              \(String(format: "%.3f", rtf))
+        Speed Factor:                  \(String(format: "%.3f", 1.0 / rtf))
         Fallbacks:                     \(timings.totalDecodingFallbacks)
         """)
     }
@@ -629,6 +635,48 @@ public struct TranscriptionProgress {
     }
 }
 
+// Callbacks to receive state updates during transcription.
+
+/// A callback that provides transcription segments as they are discovered.
+/// - Parameters:
+///   - segments: An array of `TranscriptionSegment` objects representing the transcribed segments
+public typealias SegmentDiscoveryCallback = (_ segments: [TranscriptionSegment]) -> Void
+
+/// A callback that reports changes in the model's state.
+/// - Parameters:
+///   - oldState: The previous state of the model, if any
+///   - newState: The current state of the model
+public typealias ModelStateCallback = (_ oldState: ModelState?, _ newState: ModelState) -> Void
+
+/// A callback that reports changes in the transcription process.
+/// - Parameter state: The current `TranscriptionState` of the transcription process
+public typealias TranscriptionStateCallback = (_ state: TranscriptionState) -> Void
+
+/// Represents the different states of the transcription process.
+@frozen
+public enum TranscriptionState: CustomStringConvertible {
+    /// The audio is being converted to the required format for transcription
+    case convertingAudio
+
+    /// The audio is actively being transcribed to text
+    case transcribing
+
+    /// The transcription process has completed
+    case finished
+
+    /// A human-readable description of the transcription state
+    public var description: String {
+        switch self {
+            case .convertingAudio:
+                return "Converting Audio"
+            case .transcribing:
+                return "Transcribing"
+            case .finished:
+                return "Finished"
+        }
+    }
+}
+
 /// Callback to receive progress updates during transcription.
 ///
 /// - Parameters:
@@ -649,6 +697,8 @@ public struct TranscriptionTimings: Codable {
     public var prewarmLoadTime: TimeInterval
     public var encoderLoadTime: TimeInterval
     public var decoderLoadTime: TimeInterval
+    public var encoderSpecializationTime: TimeInterval
+    public var decoderSpecializationTime: TimeInterval
     public var tokenizerLoadTime: TimeInterval
     public var audioLoading: TimeInterval
     public var audioProcessing: TimeInterval
@@ -693,6 +743,8 @@ public struct TranscriptionTimings: Codable {
                 prewarmLoadTime: TimeInterval = 0,
                 encoderLoadTime: TimeInterval = 0,
                 decoderLoadTime: TimeInterval = 0,
+                encoderSpecializationTime: TimeInterval = 0,
+                decoderSpecializationTime: TimeInterval = 0,
                 tokenizerLoadTime: TimeInterval = 0,
                 audioLoading: TimeInterval = 0,
                 audioProcessing: TimeInterval = 0,
@@ -726,6 +778,8 @@ public struct TranscriptionTimings: Codable {
         self.prewarmLoadTime = prewarmLoadTime
         self.encoderLoadTime = encoderLoadTime
         self.decoderLoadTime = decoderLoadTime
+        self.encoderSpecializationTime = encoderSpecializationTime
+        self.decoderSpecializationTime = decoderSpecializationTime
         self.tokenizerLoadTime = tokenizerLoadTime
         self.audioLoading = audioLoading
         self.audioProcessing = audioProcessing
@@ -1325,6 +1379,7 @@ extension WhisperTokenizerWrapper {
 
 // MARK: Constants
 
+@frozen
 public enum Constants {
     enum Logging {
         static let subsystem = "com.argmax.whisperkit"
@@ -1454,6 +1509,8 @@ public enum Constants {
     public static let defaultLanguageCode: String = "en"
 
     public static let defaultAudioReadFrameSize: AVAudioFrameCount = 1_323_000 // 30s of audio at commonly found 44.1khz sample rate
+
+    public static let defaultWindowSamples: Int = 480_000 // 30s of audio at 16khz sample rate default for Whisper models
 
     public static let fallbackModelSupportConfig: ModelSupportConfig = {
         var config = ModelSupportConfig(
