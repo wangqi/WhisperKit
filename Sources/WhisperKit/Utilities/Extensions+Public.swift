@@ -50,6 +50,21 @@ public extension String {
     func trimmingSpecialTokenCharacters() -> String {
         trimmingCharacters(in: Constants.specialTokenCharacters)
     }
+
+    /// Wangqi 2025-10-05
+    /// Trims occurrences of the given trailing substring up to `upto` times.
+    /// Example: "path/".trimmingFromEnd(character: "/", upto: 1) -> "path"
+    /// If the string does not end with `character`, returns self.
+    func trimmingFromEnd(character: String, upto: Int) -> String {
+        guard !character.isEmpty, upto > 0 else { return self }
+        var result = self
+        var remaining = upto
+        while remaining > 0, result.hasSuffix(character) {
+            result.removeLast(character.count)
+            remaining -= 1
+        }
+        return result
+    }
 }
 
 // MARK: CoreML

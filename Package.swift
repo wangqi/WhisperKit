@@ -23,7 +23,8 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMinor(from: "0.1.8")),
+        /// Wangqi 2025-10-05
+        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMinor(from: "1.0.0")),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
     ] + (isServerEnabled() ? [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.1"),

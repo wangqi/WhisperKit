@@ -6,7 +6,6 @@ import AVFoundation
 import CoreML
 import Foundation
 import Hub
-import TensorUtils
 import Tokenizers
 
 open class WhisperKit {
@@ -232,7 +231,8 @@ open class WhisperKit {
         let supportedModels = modelSupportConfig.modelSupport().supported
         var filteredSupportSet: Set<String> = []
         for glob in matching {
-            filteredSupportSet = filteredSupportSet.union(supportedModels.matching(glob: glob))
+            // Wangqi 2025-10-05
+            filteredSupportSet = filteredSupportSet.union(_wk_stringsMatching(supportedModels, glob: glob))
         }
         let filteredSupport = Array(filteredSupportSet)
 
@@ -1020,5 +1020,27 @@ open class WhisperKit {
             }
             throw error
         }
+    }
+}
+
+// MARK: - Local helpers
+
+/// // Wangqi 2025-10-05
+/// Local glob-matching helper to avoid relying on private extensions in swift-transformers 1.0.0.
+/// Implements simple glob patterns: '*' → any sequence, '?' → any single character. Case-insensitive.
+fileprivate func _wk_stringsMatching(_ strings: [String], glob: String) -> [String] {
+    // Convert glob to a regex pattern
+    let escaped = NSRegularExpression.escapedPattern(for: glob)
+    let pattern = "^" + escaped
+        .replacingOccurrences(of: "\\*", with: ".*")
+        .replacingOccurrences(of: "\\?", with: ".") + "$"
+
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        return []
+    }
+
+    return strings.filter { s in
+        let range = NSRange(location: 0, length: s.utf16.count)
+        return regex.firstMatch(in: s, options: [], range: range) != nil
     }
 }

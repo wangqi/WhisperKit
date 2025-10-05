@@ -1088,3 +1088,39 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
         return allFilters
     }
 }
+
+// Wangqi 2025-10-05
+// Provide convenience constructors that existed in older dependencies
+// Swift Transformers 1.0.0 no longer exposes `MLMultiArray.from(_)` helpers used by WhisperKit.
+// Define local equivalents for minimal compatibility.
+extension MLMultiArray {
+    /// Creates an `MLMultiArray` from an array of Ints with dataType `.int32` and shape `[count]`.
+    static func from(_ values: [Int]) -> MLMultiArray {
+        let shape = [NSNumber(value: values.count)]
+        let arr = try! MLMultiArray(shape: shape, dataType: .int32)
+        for (i, v) in values.enumerated() {
+            arr[i] = NSNumber(value: v)
+        }
+        return arr
+    }
+
+    /// Creates an `MLMultiArray` from an array of Float with dataType `.float32` and shape `[count]`.
+    static func from(_ values: [Float]) -> MLMultiArray {
+        let shape = [NSNumber(value: values.count)]
+        let arr = try! MLMultiArray(shape: shape, dataType: .float32)
+        for (i, v) in values.enumerated() {
+            arr[i] = NSNumber(value: v)
+        }
+        return arr
+    }
+
+    /// Creates an `MLMultiArray` from an array of Double with dataType `.double` and shape `[count]`.
+    static func from(_ values: [Double]) -> MLMultiArray {
+        let shape = [NSNumber(value: values.count)]
+        let arr = try! MLMultiArray(shape: shape, dataType: .double)
+        for (i, v) in values.enumerated() {
+            arr[i] = NSNumber(value: v)
+        }
+        return arr
+    }
+}
