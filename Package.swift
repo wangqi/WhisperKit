@@ -7,7 +7,9 @@ import Foundation
 let package = Package(
     name: "whisperkit",
     platforms: [
-        .iOS(.v16),
+        // upgraded to iOS 17 to be compatible with swift-transformers 1.2.0
+        // wangqi modified 2026-03-15
+        .iOS(.v17),
         .macOS(.v13),
         .watchOS(.v10),
         .visionOS(.v1)
@@ -23,7 +25,9 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMinor(from: "1.1.2")),
+        // widened to 1.2.x to coexist with mlx-swift-lm which requires >=1.2.0
+        // wangqi modified 2026-03-15
+        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMinor(from: "1.2.0")),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
     ] + (isServerEnabled() ? [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.1"),
