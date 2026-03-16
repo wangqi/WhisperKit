@@ -22,7 +22,7 @@ public extension WhisperKit {
 
 public extension Float {
     func rounded(_ decimalPlaces: Int) -> Float {
-        let divisor = pow(10.0, Float(decimalPlaces))
+        let divisor = Float.pow(10.0, Float(decimalPlaces))
         return (self * divisor).rounded() / divisor
     }
 }
