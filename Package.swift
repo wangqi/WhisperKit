@@ -7,10 +7,10 @@ import Foundation
 let package = Package(
     name: "whisperkit",
     platforms: [
-        // upgraded to iOS 17 to match swift-transformers 1.2.0 (via swift-huggingface iOS 17+ requirement)
-        // wangqi modified 2026-03-15
+        // upgraded to iOS 17 / macOS 14 to match swift-transformers 1.2.0 (Hub/Tokenizers require macOS 14+)
+        // wangqi modified 2026-03-17
         .iOS(.v17),
-        .macOS(.v13),
+        .macOS(.v14),
         .watchOS(.v10),
         .visionOS(.v1)
     ],
