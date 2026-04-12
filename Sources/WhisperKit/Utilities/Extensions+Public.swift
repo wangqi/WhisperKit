@@ -3,6 +3,7 @@
 
 import AVFoundation
 import CoreML
+import Foundation
 
 public extension Array where Element == TranscriptionSegment {
     func contains(segment: TranscriptionSegment) -> Bool {
@@ -22,7 +23,9 @@ public extension WhisperKit {
 
 public extension Float {
     func rounded(_ decimalPlaces: Int) -> Float {
-        let divisor = Float.pow(10.0, Float(decimalPlaces))
+        // Float.pow does not exist; use Foundation pow()
+        // wangqi modified 2026-04-12
+        let divisor = pow(10.0 as Float, Float(decimalPlaces))
         return (self * divisor).rounded() / divisor
     }
 }
