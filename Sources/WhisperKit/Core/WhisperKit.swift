@@ -1,12 +1,12 @@
 //  For licensing see accompanying LICENSE.md file.
 //  Copyright © 2024 Argmax, Inc. All rights reserved.
 
+@_exported import ArgmaxCore
 import Accelerate
+import ArgmaxCore
 import AVFoundation
 import CoreML
 import Foundation
-import Hub
-import Tokenizers
 
 open class WhisperKit {
     /// Models
@@ -18,7 +18,13 @@ open class WhisperKit {
     }
 
     public var modelCompute: ModelComputeOptions
-    public var audioInputConfig: AudioInputConfig
+    public var audioInputOptions: AudioInputOptions
+
+    @available(*, deprecated, renamed: "audioInputOptions")
+    public var audioInputConfig: AudioInputOptions {
+        get { audioInputOptions }
+        set { audioInputOptions = newValue }
+    }
     public var tokenizer: WhisperTokenizer? {
         didSet {
             // Always sync the tokenizer to the text decoder when set
@@ -55,7 +61,7 @@ open class WhisperKit {
 
     public init(_ config: WhisperKitConfig = WhisperKitConfig()) async throws {
         modelCompute = config.computeOptions ?? ModelComputeOptions()
-        audioInputConfig = config.audioInputConfig ?? AudioInputConfig()
+        audioInputOptions = config.audioInputConfigStorage ?? AudioInputOptions()
         audioProcessor = config.audioProcessor ?? AudioProcessor()
         featureExtractor = config.featureExtractor ?? FeatureExtractor()
         audioEncoder = config.audioEncoder ?? AudioEncoder()
@@ -69,7 +75,7 @@ open class WhisperKit {
         tokenizerFolder = config.tokenizerFolder ?? config.downloadBase
         useBackgroundDownloadSession = config.useBackgroundDownloadSession
         currentTimings = TranscriptionTimings()
-        Logging.shared.logLevel = config.verbose ? config.logLevel : .none
+        Logging.updateLogLevel(config.verbose ? config.logLevel : .none)
 
         try await setupModels(
             model: config.model,
@@ -77,7 +83,8 @@ open class WhisperKit {
             modelRepo: config.modelRepo,
             modelToken: config.modelToken,
             modelFolder: config.modelFolder,
-            download: config.download
+            download: config.download,
+            endpoint: config.modelEndpoint ?? Constants.defaultRemoteEndpoint
         )
 
         if let prewarm = config.prewarm, prewarm {
@@ -173,6 +180,7 @@ open class WhisperKit {
             remoteConfigName: remoteConfigName,
             endpoint: endpoint
         )
+        
         return ModelUtilities.modelSupport(for: deviceName, from: config)
     }
 
@@ -183,13 +191,14 @@ open class WhisperKit {
         remoteConfigName: String = Constants.defaultRemoteConfigName,
         endpoint: String = Constants.defaultRemoteEndpoint
     ) async -> ModelSupportConfig {
-        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token, endpoint: endpoint)
+        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint)
+        let repoRef = HubApiWrapper.Repo(id: repo)
         var modelSupportConfig = Constants.fallbackModelSupportConfig
 
         do {
             // Try to decode config file into ModelSupportConfig
             Logging.debug("Searching for config file matching \"\(remoteConfigName)\" in \(repo)")
-            let files = try await hubApi.getFilenames(from: repo, matching: remoteConfigName)
+            let files = try await hubApi.getFilenames(from: repoRef, matching: [remoteConfigName])
             if files.count > 1 {
                 Logging.info("Multiple config files found (\(files.count)): \(files). Using first matching file: \(files.first ?? "none")")
             } else if files.isEmpty {
@@ -201,7 +210,7 @@ open class WhisperKit {
             // Use the first file in the list, or default to Constants.defaultRemoteConfigName
             let configFileName = files.first ?? Constants.defaultRemoteConfigName
             
-            let configUrl = try await hubApi.snapshot(from: repo, matching: configFileName)
+            let configUrl = try await hubApi.snapshot(from: repoRef, matching: [configFileName])
             let decoder = JSONDecoder()
             let jsonData = try Data(contentsOf: configUrl.appendingPathComponent(configFileName))
             modelSupportConfig = try decoder.decode(ModelSupportConfig.self, from: jsonData)
@@ -231,8 +240,7 @@ open class WhisperKit {
         let supportedModels = modelSupportConfig.modelSupport().supported
         var filteredSupportSet: Set<String> = []
         for glob in matching {
-            // Wangqi 2025-10-05
-            filteredSupportSet = filteredSupportSet.union(_wk_stringsMatching(supportedModels, glob: glob))
+            filteredSupportSet = filteredSupportSet.union(supportedModels.matching(glob: glob))
         }
         let filteredSupport = Array(filteredSupportSet)
 
@@ -246,10 +254,10 @@ open class WhisperKit {
         from repo: String = "argmaxinc/whisperkit-coreml",
         token: String? = nil,
         endpoint: String = Constants.defaultRemoteEndpoint,
-        progressCallback: ((Progress) -> Void)? = nil
+        progressCallback: ProgressCallback? = nil
     ) async throws -> URL {
-        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token, endpoint: endpoint, useBackgroundSession: useBackgroundSession)
-        let repo = Hub.Repo(id: repo, type: .models)
+        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint, useBackgroundSession: useBackgroundSession)
+        let repo = HubApiWrapper.Repo(id: repo, type: .models)
         var modelSearchPath = "*\(variant.description)/*"
         do {
             Logging.debug("Searching for models matching \"\(modelSearchPath)\" in \(repo)")
@@ -283,7 +291,7 @@ open class WhisperKit {
 
             Logging.debug("Downloading model \(variantPath)...")
             let modelFolder = try await hubApi.snapshot(from: repo, matching: [modelSearchPath]) { progress in
-                Logging.debug(progress)
+                Logging.debug(progress.debugDescription)
                 if let callback = progressCallback {
                     callback(progress)
                 }
@@ -292,7 +300,7 @@ open class WhisperKit {
             let modelFolderName = modelFolder.appending(path: variantPath)
             return modelFolderName
         } catch {
-            Logging.debug(error)
+            Logging.debug(error.localizedDescription)
             throw error
         }
     }
@@ -370,7 +378,6 @@ open class WhisperKit {
         let logmelUrl = ModelUtilities.detectModelURL(inFolder: path, named: "MelSpectrogram")
         let encoderUrl = ModelUtilities.detectModelURL(inFolder: path, named: "AudioEncoder")
         let decoderUrl = ModelUtilities.detectModelURL(inFolder: path, named: "TextDecoder")
-        let decoderPrefillUrl = ModelUtilities.detectModelURL(inFolder: path, named: "TextDecoderContextPrefill")
 
         for item in [logmelUrl, encoderUrl, decoderUrl] {
             if !FileManager.default.fileExists(atPath: item.path) {
@@ -386,17 +393,6 @@ open class WhisperKit {
                 prewarmMode: prewarmMode
             )
             Logging.debug("Loaded feature extractor")
-        }
-
-        if FileManager.default.fileExists(atPath: decoderPrefillUrl.path) {
-            Logging.debug("Loading text decoder prefill data")
-            textDecoder.prefillData = TextDecoderContextPrefill()
-            try await textDecoder.prefillData?.loadModel(
-                at: decoderPrefillUrl,
-                computeUnits: modelCompute.prefillCompute,
-                prewarmMode: prewarmMode
-            )
-            Logging.debug("Loaded text decoder prefill data")
         }
 
         if let textDecoder = textDecoder as? WhisperMLModel {
@@ -448,7 +444,7 @@ open class WhisperKit {
 
         currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart + currentTimings.prewarmLoadTime
 
-        Logging.info("Loaded models for whisper size: \(modelVariant) in \(String(format: "%.2f", currentTimings.modelLoading))s")
+        Logging.info("Loaded models in \(String(format: "%.2f", currentTimings.modelLoading))s")
     }
 
     open func loadTokenizerIfNeeded() async throws {
@@ -466,15 +462,15 @@ open class WhisperKit {
         textDecoder.isModelMultilingual = ModelUtilities.isModelMultilingual(logitsDim: logitsDim)
         modelVariant = ModelUtilities.detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
 
-        Logging.debug("Loading tokenizer for \(modelVariant)")
+        Logging.info("Loading tokenizer for whisper size: \(modelVariant)")
         let tokenizerLoadStart = CFAbsoluteTimeGetCurrent()
 
         // Search model folder for tokenizer if it is bundled with the model
         let additionalSearchPaths: [URL]
         if let modelFolder {
             // TODO: remove hub path in future version, retained as additional search path for backward compatibility
-            let hubTokenizerFolderFromModel = HubApi(downloadBase: modelFolder).localRepoLocation(
-                HubApi.Repo(id: ModelUtilities.tokenizerNameForVariant(modelVariant))
+            let hubTokenizerFolderFromModel = HubApiWrapper(downloadBase: modelFolder).localRepoLocation(
+                HubApiWrapper.Repo(id: ModelUtilities.tokenizerNameForVariant(modelVariant))
             )
 
             additionalSearchPaths = [modelFolder] + [hubTokenizerFolderFromModel]
@@ -519,7 +515,7 @@ open class WhisperKit {
 
     /// Pass in your own logging callback here
     open func loggingCallback(_ callback: Logging.LoggingCallback?) {
-        Logging.shared.loggingCallback = callback
+        Logging.updateCallback(callback)
     }
 
     // MARK: - Detect language
@@ -558,7 +554,7 @@ open class WhisperKit {
             throw WhisperError.tokenizerUnavailable()
         }
 
-        let options = DecodingOptions(verbose: Logging.shared.logLevel != .none)
+        let options = DecodingOptions(verbose: Logging.isLoggingEnabled)
         let decoderInputs = try textDecoder.prepareDecoderInputs(withPrompt: [tokenizer.specialTokens.startOfTranscriptToken])
 
         // Detect language using up to the first 30 seconds
@@ -593,14 +589,26 @@ open class WhisperKit {
     // MARK: - Transcribe multiple audio files
 
     /// Convenience method to transcribe multiple audio files asynchronously and return the results as an array of optional arrays of `TranscriptionResult`.
+    ///
+    /// - Parameters:
+    ///   - audioPaths: An array of file paths pointing to the audio files to be transcribed.
+    ///   - decodeOptions: Optional decoding options to customize the transcription process.
+    ///   - audioInputOptions: Channel processing and file-loading options. When `nil`, the instance's `audioInputOptions` is used (full-file loading by default).
+    ///   - callback: Optional callback to receive updates during the transcription process.
+    ///
     /// - Returns: An array of optional arrays containing `TranscriptionResult`.
+    ///
+    /// - Note: The default loading mode will change to `.incremental` in a future major version.
+    ///   Consider using `.incremental` for large audio files to reduce memory usage.
     open func transcribe(
         audioPaths: [String],
+        audioInputOptions: AudioInputOptions? = nil,
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async -> [[TranscriptionResult]?] {
         let transcribeResults = await transcribeWithResults(
             audioPaths: audioPaths,
+            audioInputOptions: audioInputOptions,
             decodeOptions: decodeOptions,
             callback: callback
         )
@@ -616,58 +624,127 @@ open class WhisperKit {
     /// - Parameters:
     ///   - audioPaths: An array of file paths pointing to the audio files to be transcribed.
     ///   - decodeOptions: Optional decoding options to customize the transcription process.
+    ///   - audioInputOptions: Channel processing and file-loading options. When `nil`, the instance's `audioInputOptions` is used (full-file loading by default).
     ///   - callback: Optional callback to receive updates during the transcription process.
     ///
     /// - Returns: An array of `Result` objects with either a successful transcription result or an error.
+    ///
+    /// - Note: The default loading mode will change to `.incremental` in a future major version.
+    ///   Consider using `.incremental` for large audio files to reduce memory usage.
     open func transcribeWithResults(
         audioPaths: [String],
+        audioInputOptions: AudioInputOptions? = nil,
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async -> [Result<[TranscriptionResult], Swift.Error>] {
-        transcriptionStateCallback?(.convertingAudio)
+        let resolvedOptions = audioInputOptions ?? self.audioInputOptions
+        switch resolvedOptions.audioLoadingMode {
+        case .fullFile:
+            transcriptionStateCallback?(.convertingAudio)
 
-        // Start timing the audio loading and conversion process
-        let loadAudioStart = Date()
+            // Start timing the audio loading and conversion process
+            let loadAudioStart = Date()
 
-        // Load and extract audio data from the provided file paths
-        let loadedAudioResult = await AudioProcessor.loadAudio(at: audioPaths, channelMode: audioInputConfig.channelMode)
-        let audioArrays = loadedAudioResult.compactMap { try? $0.get() }
+            // Load and extract audio data from the provided file paths
+            let loadedAudioResult = await AudioProcessor.loadAudio(at: audioPaths, channelMode: resolvedOptions.channelMode)
+            let audioArrays = loadedAudioResult.compactMap { try? $0.get() }
 
-        // Calculate the time taken to load and convert audio
-        let loadAndConvertTime = Date().timeIntervalSince(loadAudioStart)
-        currentTimings.audioLoading = loadAndConvertTime
-        Logging.debug("Total Audio Loading and Converting Time: \(loadAndConvertTime)")
+            // Calculate the time taken to load and convert audio
+            let loadAndConvertTime = Date().timeIntervalSince(loadAudioStart)
+            currentTimings.audioLoading = loadAndConvertTime
+            Logging.debug("Total Audio Loading and Converting Time: \(loadAndConvertTime)")
 
-        transcriptionStateCallback?(.transcribing)
-        defer {
-            transcriptionStateCallback?(.finished)
-        }
-
-        // Transcribe the loaded audio arrays
-        let transcribeResults = await transcribeWithResults(
-            audioArrays: audioArrays,
-            decodeOptions: decodeOptions,
-            callback: callback
-        )
-
-        // Initialize the result array to hold final transcription results
-        var result = [Result<[TranscriptionResult], Swift.Error>]()
-        var transcribeResultIndex = 0
-
-        // Iterate over loadedAudioResult and map each to the corresponding transcription result
-        for audioResult in loadedAudioResult {
-            switch audioResult {
-                case .success:
-                    // Append transcription result if audio loading was successful (may still contain failure)
-                    result.append(transcribeResults[transcribeResultIndex])
-                    transcribeResultIndex += 1
-                case let .failure(error):
-                    // Append failure result if audio loading failed
-                    result.append(.failure(error))
+            transcriptionStateCallback?(.transcribing)
+            defer {
+                transcriptionStateCallback?(.finished)
             }
+
+            // Transcribe the loaded audio arrays
+            let transcribeResults = await transcribeWithResults(
+                audioArrays: audioArrays,
+                decodeOptions: decodeOptions,
+                callback: callback
+            )
+
+            // Initialize the result array to hold final transcription results
+            var result = [Result<[TranscriptionResult], Swift.Error>]()
+            var transcribeResultIndex = 0
+
+            // Iterate over loadedAudioResult and map each to the corresponding transcription result
+            for audioResult in loadedAudioResult {
+                switch audioResult {
+                    case .success:
+                        // Append transcription result if audio loading was successful (may still contain failure)
+                        result.append(transcribeResults[transcribeResultIndex])
+                        transcribeResultIndex += 1
+                    case let .failure(error):
+                        // Append failure result if audio loading failed
+                        result.append(.failure(error))
+                }
+            }
+
+            return result
+        case .incremental(let chunkDurationSeconds, let maxBufferedChunks):
+            // Start timing the audio streaming and transcription process right away, skip .convertingAudio
+            transcriptionStateCallback?(.transcribing)
+            defer {
+                transcriptionStateCallback?(.finished)
+            }
+            let transcriptionStart = Date()
+            let concurrentWorkerCount = decodeOptions?.concurrentWorkerCount ?? 0
+            let indexedAudioPaths = audioPaths.enumerated().map { (index: $0.offset, path: $0.element) }
+            let batchedAudioPaths = concurrentWorkerCount == 0 ? [indexedAudioPaths] : indexedAudioPaths.batched(into: concurrentWorkerCount)
+
+            var result = [Result<[TranscriptionResult], Swift.Error>]()
+            for audioPathBatch in batchedAudioPaths {
+                let partialResult = await withTaskGroup(of: (index: Int, result: Result<[TranscriptionResult], Swift.Error>).self) { taskGroup -> [Result<[TranscriptionResult], Swift.Error>] in
+                    let weakSelf = WeakSendableWrapper(self)
+                    for indexedAudioPath in audioPathBatch {
+                        taskGroup.addTask {
+                            do {
+                                guard let self = weakSelf.value else {
+                                    return (index: indexedAudioPath.index, result: .failure(WhisperError.transcriptionFailed("WhisperKit instance was deallocated")))
+                                }
+                                let audioStream = try AudioProcessor.loadFileIncrementally(
+                                    fromPath: indexedAudioPath.path,
+                                    channelMode: resolvedOptions.channelMode,
+                                    chunkDurationSeconds: chunkDurationSeconds,
+                                    maxBufferedChunks: maxBufferedChunks,
+                                    maxChunkLength: self.featureExtractor.windowSamples ?? Constants.defaultWindowSamples,
+                                    vad: self.voiceActivityDetector ?? EnergyVAD()
+                                )
+                                let transcriptionResults = try await self.transcribeFileStream(
+                                    audioStream: audioStream,
+                                    decodeOptions: decodeOptions,
+                                    callback: callback,
+                                    emitStateCallbacks: false
+                                )
+                                return (index: indexedAudioPath.index, result: .success(transcriptionResults))
+                            } catch {
+                                return (index: indexedAudioPath.index, result: .failure(error))
+                            }
+                        }
+                    }
+
+                    var batchResults = [(index: Int, result: Result<[TranscriptionResult], Swift.Error>)]()
+                    for await taskResult in taskGroup {
+                        batchResults.append(taskResult)
+                    }
+
+                    batchResults.sort(by: { $0.index < $1.index })
+                    return batchResults.map { $0.result }
+                }
+                result.append(contentsOf: partialResult)
+            }
+
+            let audioProcessTime = Date().timeIntervalSince(transcriptionStart)
+            currentTimings.audioProcessing = audioProcessTime
+            Logging.debug("Total Audio Streaming and Transcription Time: \(audioProcessTime)")
+            return result
         }
 
-        return result
+
+
     }
 
     // MARK: - Transcribe multiple audio arrays
@@ -677,7 +754,7 @@ open class WhisperKit {
     open func transcribe(
         audioArrays: [[Float]],
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async -> [[TranscriptionResult]?] {
         let transcribeResults = await transcribeWithResults(
             audioArrays: audioArrays,
@@ -703,7 +780,7 @@ open class WhisperKit {
     open func transcribeWithResults(
         audioArrays: [[Float]],
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async -> [Result<[TranscriptionResult], Swift.Error>] {
         // Create an array of decoding options with the same value for each audio array
         let decodeOptionsArray = Array(repeating: decodeOptions, count: audioArrays.count)
@@ -727,7 +804,7 @@ open class WhisperKit {
         audioArrays: [[Float]],
         decodeOptionsArray: [DecodingOptions?] = [nil],
         seekOffsets: [Int]? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async -> [Result<[TranscriptionResult], Swift.Error>] {
         var result = [Result<[TranscriptionResult], Swift.Error>]()
 
@@ -752,39 +829,44 @@ open class WhisperKit {
             // Use withTaskGroup to manage concurrent transcription tasks
             let partialResult = await withTaskGroup(of: [(index: Int, result: Result<[TranscriptionResult], Swift.Error>)].self) { taskGroup -> [Result<[TranscriptionResult], Swift.Error>] in
                 for (audioIndex, audioArray) in audioArrayBatch.enumerated() {
+                    // This element's index in the original input, used to look up
+                    // its entry in the per-element arrays (`decodeOptionsArray`, `seekOffsets`).
+                    let windowId = batchIndex * concurrentWorkerCount + audioIndex
+
                     // Setup callback to keep track of batches and chunks
-                    let batchedAudioCallback: ((TranscriptionProgress) -> Bool?) = { progress in
+                    let batchedAudioCallback: TranscriptionCallback = { progress in
                         var batchedProgress = progress
-                        batchedProgress.windowId = audioIndex + batchIndex * audioArrayBatch.count
+                        batchedProgress.windowId = windowId
                         return callback?(batchedProgress)
                     }
 
                     // Setup segment callback to track chunk seek positions for segment discovery
                     let batchedSegmentCallback: SegmentDiscoveryCallback? = if let seekOffsets {
-                        { segments in
-                            let windowId = audioIndex + batchIndex * audioArrayBatch.count
-                            let seekOffset = seekOffsets[windowId]
-                            var adjustedSegments = segments
-                            for i in 0..<adjustedSegments.count {
-                                adjustedSegments[i].seek += Int(seekOffset)
+                        { [segmentDiscoveryCallback] segments in
+                            let adjustedSegments = segments.map {
+                                TranscriptionUtilities.updateSegmentTimings(segment: $0, seekOffsetIndex: seekOffsets[windowId])
                             }
-                            self.segmentDiscoveryCallback?(adjustedSegments)
+                            segmentDiscoveryCallback?(adjustedSegments)
                         }
                     } else {
                         self.segmentDiscoveryCallback
                     }
 
                     // Setup decoding options for the current audio array
-                    let batchedDecodeOptions = decodeOptionsArray[audioIndex]
+                    let batchedDecodeOptions = decodeOptionsArray[windowId]
 
                     // Add a new task to the task group for each audio array
+                    let weakSelf = WeakSendableWrapper(self)
                     taskGroup.addTask {
                         do {
+                            guard let self = weakSelf.value else {
+                                return [(index: audioIndex, result: .failure(WhisperError.transcriptionFailed("WhisperKit instance was deallocated")))]
+                            }
                             let transcribeResult: [TranscriptionResult] = try await self.transcribe(
                                 audioArray: audioArray,
                                 decodeOptions: batchedDecodeOptions,
                                 callback: batchedAudioCallback,
-                                segmentCallback: batchedSegmentCallback ?? self.segmentDiscoveryCallback
+                                segmentCallback: batchedSegmentCallback
                             )
                             // Return the successful transcription result with its index
                             return [(index: audioIndex, result: .success(transcribeResult))]
@@ -817,71 +899,82 @@ open class WhisperKit {
 
     // MARK: - Transcribe single audio file
 
-    @available(*, deprecated, message: "Subject to removal in a future version. Use `transcribe(audioPath:decodeOptions:callback:) async throws -> [TranscriptionResult]` instead.")
-    @_disfavoredOverload
-    open func transcribe(
-        audioPath: String,
-        decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
-    ) async throws -> TranscriptionResult? {
-        let result: [TranscriptionResult] = try await transcribe(audioPath: audioPath, decodeOptions: decodeOptions, callback: callback)
-        return result.first
-    }
-
     /// Transcribes an audio file from the given path asynchronously.
     /// - Parameters:
     ///   - audioPath: The file path to the audio file to be transcribed.
     ///   - decodeOptions: Options for how to transcribe audio. Includes a chunking strategy and the number of concurrent workers to parallelize the task.
+    ///   - audioInputOptions: Channel processing and file-loading options. When `nil`, the instance's `audioInputOptions` is used (full-file loading by default).
     ///   - callback: Optional callback to receive updates during the transcription process.
     /// - Returns: An array of `TranscriptionResult`.
     /// - Throws: An error if the transcription fails.
+    ///
+    /// - Note: The default loading mode will change to `.incremental` in a future major version.
+    ///   Consider using `.incremental` for large audio files to reduce memory usage.
     open func transcribe(
         audioPath: String,
+        audioInputOptions: AudioInputOptions? = nil,
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback? = nil
     ) async throws -> [TranscriptionResult] {
-        transcriptionStateCallback?(.convertingAudio)
+        let resolvedOptions = audioInputOptions ?? self.audioInputOptions
+        switch resolvedOptions.audioLoadingMode {
+        case .fullFile:
+            transcriptionStateCallback?(.convertingAudio)
 
-        // Process input audio file into audio samples
-        let audioArray = try await withThrowingTaskGroup(of: [Float].self) { group -> [Float] in
-            let convertAudioStart = Date()
-            defer {
-                let convertTime = Date().timeIntervalSince(convertAudioStart)
-                currentTimings.audioLoading = convertTime
-                Logging.debug("Audio loading and convert time: \(convertTime)")
-                Logging.logCurrentMemoryUsage("Audio Loading and Convert")
+            // Process input audio file into audio samples
+            let audioArray = try await withThrowingTaskGroup(of: [Float].self) { group -> [Float] in
+                let convertAudioStart = Date()
+                defer {
+                    let convertTime = Date().timeIntervalSince(convertAudioStart)
+                    currentTimings.audioLoading = convertTime
+                    Logging.debug("Audio loading and convert time: \(convertTime)")
+                    Logging.logCurrentMemoryUsage("Audio Loading and Convert")
+                }
+                return try AudioProcessor.loadAudioAsFloatArray(fromPath: audioPath, channelMode: resolvedOptions.channelMode)
             }
-            return try AudioProcessor.loadAudioAsFloatArray(fromPath: audioPath, channelMode: audioInputConfig.channelMode)
+
+            transcriptionStateCallback?(.transcribing)
+            defer {
+                transcriptionStateCallback?(.finished)
+            }
+
+            // Send converted samples to be transcribed
+            let transcribeResults: [TranscriptionResult] = try await transcribe(
+                audioArray: audioArray,
+                decodeOptions: decodeOptions,
+                callback: callback
+            )
+
+            return transcribeResults
+        case .incremental(let chunkDurationSeconds, let maxBufferedChunks):
+            let audioLoadStart = Date()
+            defer {
+                let audioLoadTime = Date().timeIntervalSince(audioLoadStart)
+                currentTimings.audioLoading = audioLoadTime
+                Logging.debug("Audio streaming and transcription time: \(audioLoadTime)")
+                Logging.logCurrentMemoryUsage("Audio Streaming")
+            }
+
+            // Create audio stream for memory-efficient processing
+            let audioStream = try AudioProcessor.loadFileIncrementally(
+                fromPath: audioPath,
+                channelMode: resolvedOptions.channelMode,
+                chunkDurationSeconds: chunkDurationSeconds,
+                maxBufferedChunks: maxBufferedChunks,
+                maxChunkLength: featureExtractor.windowSamples ?? Constants.defaultWindowSamples,
+                vad: voiceActivityDetector ?? EnergyVAD()
+            )
+
+            // Process audio stream
+            return try await transcribeFileStream(
+                audioStream: audioStream,
+                decodeOptions: decodeOptions,
+                callback: callback
+            )
         }
-
-        transcriptionStateCallback?(.transcribing)
-        defer {
-            transcriptionStateCallback?(.finished)
-        }
-
-        // Send converted samples to be transcribed
-        let transcribeResults: [TranscriptionResult] = try await transcribe(
-            audioArray: audioArray,
-            decodeOptions: decodeOptions,
-            callback: callback
-        )
-
-        return transcribeResults
     }
 
     // MARK: - Transcribe single audio sample array
-
-    /// Deprecated
-    @available(*, deprecated, message: "Subject to removal in a future version. Use `transcribe(audioArray:decodeOptions:callback:) async throws -> [TranscriptionResult]` instead.")
-    @_disfavoredOverload
-    open func transcribe(
-        audioArray: [Float],
-        decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
-    ) async throws -> TranscriptionResult? {
-        let result: [TranscriptionResult] = try await transcribe(audioArray: audioArray, decodeOptions: decodeOptions, callback: callback)
-        return result.first
-    }
 
     /// Main entry point for transcribing audio
     /// - Parameters:
@@ -894,7 +987,32 @@ open class WhisperKit {
     open func transcribe(
         audioArray: [Float],
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil,
+        callback: TranscriptionCallback? = nil,
+        segmentCallback: SegmentDiscoveryCallback? = nil
+    ) async throws -> [TranscriptionResult] {
+        try await transcribe(
+            audioArray: audioArray,
+            audioArrayOffset: 0,
+            decodeOptions: decodeOptions,
+            callback: callback,
+            segmentCallback: segmentCallback
+        )
+    }
+
+    /// Transcribes an audio array that is a slice of a larger source, aligning discovered segments to the source.
+    /// - Parameters:
+    ///   - audioArray: Array of 16khz raw float audio samples
+    ///   - audioArrayOffset: Offset of input Array if it's a subarray of a larger array, used to align segment callback
+    ///   - decodeOptions: Options for how to transcribe audio. Including a chunking strategy and the number of concurrent workers will paralleize this task.
+    ///   - callback: Optional callback to receive updates during the transcription process.
+    ///   - segmentCallback: Optional callback to receive segment discovery updates during transcription.
+    /// - Returns: An array of sorted `TranscriptionResult`.
+    /// - Throws: An error if the transcription fails.
+    open func transcribe(
+        audioArray: [Float],
+        audioArrayOffset: Int,
+        decodeOptions: DecodingOptions? = nil,
+        callback: TranscriptionCallback? = nil,
         segmentCallback: SegmentDiscoveryCallback? = nil
     ) async throws -> [TranscriptionResult] {
         var transcribeResults = [TranscriptionResult]()
@@ -925,7 +1043,7 @@ open class WhisperKit {
                 let chunkedResults: [Result<[TranscriptionResult], Swift.Error>] = await transcribeWithOptions(
                     audioArrays: audioChunks.map { $0.audioSamples },
                     decodeOptionsArray: chunkedDecodeOptions,
-                    seekOffsets: audioChunks.map { $0.seekOffsetIndex },
+                    seekOffsets: audioChunks.map { audioArrayOffset + $0.seekOffsetIndex },
                     callback: callback
                 )
 
@@ -938,11 +1056,28 @@ open class WhisperKit {
                 transcribeResults = updatedTranscriptionResults
             default:
                 // Audio is short enough to transcribe in a single window and doesn't require chunking
+                // Adjust discovered segment offsets when this audio array represents a slice of a larger file.
+                let decoratedSegmentCallback: SegmentDiscoveryCallback? = {
+                    guard audioArrayOffset > 0 else {
+                        return segmentCallback ?? self.segmentDiscoveryCallback
+                    }
+
+                    guard let actualCallback = segmentCallback ?? self.segmentDiscoveryCallback else {
+                        return nil
+                    }
+
+                    return { segments in
+                        let adjustedSegments = segments.map {
+                            TranscriptionUtilities.updateSegmentTimings(segment: $0, seekOffsetIndex: audioArrayOffset)
+                        }
+                        actualCallback(adjustedSegments)
+                    }
+                }()
                 transcribeResults = try await runTranscribeTask(
                     audioArray: audioArray,
                     decodeOptions: decodeOptions,
                     callback: callback,
-                    segmentCallback: segmentCallback ?? self.segmentDiscoveryCallback
+                    segmentCallback: decoratedSegmentCallback
                 )
         }
 
@@ -986,7 +1121,7 @@ open class WhisperKit {
     open func runTranscribeTask(
         audioArray: [Float],
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil,
+        callback: TranscriptionCallback? = nil,
         segmentCallback: SegmentDiscoveryCallback? = nil
     ) async throws -> [TranscriptionResult] {
         if modelState != .loaded {
@@ -1044,26 +1179,67 @@ open class WhisperKit {
             throw error
         }
     }
-}
 
-// MARK: - Local helpers
 
-/// // Wangqi 2025-10-05
-/// Local glob-matching helper to avoid relying on private extensions in swift-transformers 1.0.0.
-/// Implements simple glob patterns: '*' → any sequence, '?' → any single character. Case-insensitive.
-fileprivate func _wk_stringsMatching(_ strings: [String], glob: String) -> [String] {
-    // Convert glob to a regex pattern
-    let escaped = NSRegularExpression.escapedPattern(for: glob)
-    let pattern = "^" + escaped
-        .replacingOccurrences(of: "\\*", with: ".*")
-        .replacingOccurrences(of: "\\?", with: ".") + "$"
+    /// Transcribes audio data from an async throwing stream of audio chunks, optimizing memory usage for large files.
+    /// This function processes audio chunks as they become available rather than loading entire files into memory.
+    /// - Parameters:
+    ///   - audioStream: Async throwing stream yielding audio chunks with position information
+    ///   - decodeOptions: Options for how to transcribe audio. Includes a chunking strategy and the number of concurrent workers to parallelize the task.
+    ///   - callback: Optional callback to receive updates during the transcription process.
+    /// - Returns: An array of `TranscriptionResult` sorted by timestamp.
+    /// - Throws: An error if the transcription fails.
+    private func transcribeFileStream(
+        audioStream: AudioProcessor.IncrementalFileStream,
+        decodeOptions: DecodingOptions? = nil,
+        callback: TranscriptionCallback? = nil,
+        emitStateCallbacks: Bool = true
+    ) async throws -> [TranscriptionResult] {
+        // clipTimestamps are file-relative, but each streamed chunk decodes from its own sample 0, so
+        // they cannot be honored per chunk. Reject explicitly rather than produce incorrect output.
+        if let clipTimestamps = decodeOptions?.clipTimestamps, !clipTimestamps.isEmpty {
+            throw WhisperError.transcriptionFailed(
+                "clipTimestamps is not supported with AudioLoadingMode.incremental. Use .fullFile, or transcribe the desired range as a separate call."
+            )
+        }
 
-    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-        return []
-    }
+        var allResults = [TranscriptionResult]()
 
-    return strings.filter { s in
-        let range = NSRange(location: 0, length: s.utf16.count)
-        return regex.firstMatch(in: s, options: [], range: range) != nil
+        if emitStateCallbacks {
+            transcriptionStateCallback?(.transcribing)
+        }
+        defer {
+            if emitStateCallbacks {
+                transcriptionStateCallback?(.finished)
+            }
+        }
+
+        for try await chunk in audioStream {
+            defer {
+                chunk.completionSignal()
+            }
+
+            // Process each chunk using the main transcribe function
+            let chunkResults: [TranscriptionResult] = try await transcribe(
+                audioArray: chunk.audioChunk.audioSamples,
+                audioArrayOffset: chunk.audioChunk.seekOffsetIndex,
+                decodeOptions: decodeOptions,
+                callback: callback
+            )
+
+            // Update timestamps based on chunk's seek offset
+            let seekTimeOffset = Float(chunk.audioChunk.seekOffsetIndex) / Float(WhisperKit.sampleRate)
+            for result in chunkResults {
+                result.segments = result.segments.map { segment in
+                    TranscriptionUtilities.updateSegmentTimings(segment: segment, seekOffsetIndex: chunk.audioChunk.seekOffsetIndex)
+                }
+                result.seekTime = seekTimeOffset + (result.seekTime ?? 0)
+            }
+
+            allResults.append(contentsOf: chunkResults)
+        }
+
+        // Sort by absolute seek time for a stable total order, including chunks with no segments.
+        return allResults.sorted { ($0.seekTime ?? 0) < ($1.seekTime ?? 0) }
     }
 }

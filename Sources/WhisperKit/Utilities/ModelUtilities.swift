@@ -1,15 +1,12 @@
 //  For licensing see accompanying LICENSE.md file.
 //  Copyright © 2024 Argmax, Inc. All rights reserved.
 
+import ArgmaxCore
 import CoreML
-import Hub
-import Tokenizers
 
-public struct ModelUtilities {
+extension ModelUtilities {
 
-    private init() {}
-
-    // MARK: Public
+    // MARK: - WhisperKit Model Support
 
     public static func modelSupport(for deviceName: String, from config: ModelSupportConfig? = nil) -> ModelSupport {
         let config = config ?? Constants.fallbackModelSupportConfig
@@ -24,8 +21,8 @@ public struct ModelUtilities {
         useBackgroundSession: Bool = false
     ) async throws -> WhisperTokenizer {
         let tokenizerName = tokenizerNameForVariant(pretrained)
-        let hubApi = HubApi(downloadBase: tokenizerFolder, useBackgroundSession: useBackgroundSession)
-        let hubTokenizerFolder = hubApi.localRepoLocation(HubApi.Repo(id: tokenizerName))
+        let hubApi = HubApiWrapper(downloadBase: tokenizerFolder, useBackgroundSession: useBackgroundSession)
+        let hubTokenizerFolder = hubApi.localRepoLocation(HubApiWrapper.Repo(id: tokenizerName))
         
         // Determine which local folder to use
         let localTokenizerFolder: URL? = {
@@ -59,16 +56,9 @@ public struct ModelUtilities {
         // If we found a local folder with a tokenizer.json, try to load from it
         if let localFolder = localTokenizerFolder {
             do {
-                let localConfig = LanguageModelConfigurationFromHub(modelFolder: localFolder, hubApi: hubApi)
-                if let tokenizerConfig = try await localConfig.tokenizerConfig {
-                    let tokenizerData = try await localConfig.tokenizerData
-                    let whisperTokenizer = try PreTrainedTokenizer(tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData)
-                    Logging.debug("Loading tokenizer from \(localFolder.path)")
-                    return WhisperTokenizerWrapper(tokenizer: whisperTokenizer, at: localFolder)
-                } else {
-                    // tokenizerConfig is nil, fall through to load from Hub
-                    Logging.debug("Tokenizer configuration not found in local config")
-                }
+                Logging.debug("Loading tokenizer from \(localFolder.path)")
+                let wrapper = try await AutoTokenizerWrapper.from(modelFolder: localFolder, hubApi: hubApi)
+                return WhisperTokenizerWrapper(tokenizer: wrapper, at: localFolder)
             } catch {
                 // Error during the local loading process and fall through to load from Hub
                 Logging.debug("Error loading local tokenizer: \(error)")
@@ -78,28 +68,12 @@ public struct ModelUtilities {
         // Fallback to downloading from the Hub if local loading is not possible or fails
         Logging.debug("Downloading tokenizer from Hub at \(hubTokenizerFolder)")
         return try await WhisperTokenizerWrapper(
-            tokenizer: AutoTokenizer.from(
+            tokenizer: AutoTokenizerWrapper.from(
                 pretrained: tokenizerName,
                 hubApi: hubApi
             ),
             at: hubTokenizerFolder
         )
-    }
-
-    public static func detectModelURL(inFolder path: URL, named modelName: String) -> URL {
-        let compiledUrl = path.appending(path: "\(modelName).mlmodelc")
-        let packageUrl = path.appending(path: "\(modelName).mlpackage/Data/com.apple.CoreML/model.mlmodel")
-
-        let compiledModelExists: Bool = FileManager.default.fileExists(atPath: compiledUrl.path)
-        let packageModelExists: Bool = FileManager.default.fileExists(atPath: packageUrl.path)
-
-        // Swap to mlpackage only if the following is true: we found the mlmodel within the mlpackage, and we did not find a .mlmodelc
-        var modelURL = compiledUrl
-        if packageModelExists && !compiledModelExists {
-            modelURL = packageUrl
-        }
-
-        return modelURL
     }
     
     /// Formats and sorts model file names based on model variants
@@ -198,40 +172,6 @@ public struct ModelUtilities {
         return modelVariant
     }
 
-    static func getModelInputDimention(_ model: MLModel?, named: String, position: Int) -> Int? {
-        guard let inputDescription = model?.modelDescription.inputDescriptionsByName[named] else { return nil }
-        guard inputDescription.type == .multiArray else { return nil }
-        guard let shapeConstraint = inputDescription.multiArrayConstraint else { return nil }
-        let shape = shapeConstraint.shape.map { $0.intValue }
-        return shape[position]
-    }
-
-    static func getModelOutputDimention(_ model: MLModel?, named: String, position: Int) -> Int? {
-        guard let inputDescription = model?.modelDescription.outputDescriptionsByName[named] else { return nil }
-        guard inputDescription.type == .multiArray else { return nil }
-        guard let shapeConstraint = inputDescription.multiArrayConstraint else { return nil }
-        let shape = shapeConstraint.shape.map { $0.intValue }
-        return shape[position]
-    }
-
-    func getModelInputDimention(_ model: MLModel?, named: String, position: Int) -> Int? {
-        guard let inputDescription = model?.modelDescription.inputDescriptionsByName[named] else { return nil }
-        guard inputDescription.type == .multiArray else { return nil }
-        guard let shapeConstraint = inputDescription.multiArrayConstraint else { return nil }
-        let shape = shapeConstraint.shape.map { $0.intValue }
-        return shape[position]
-    }
-
-    func getModelOutputDimention(_ model: MLModel?, named: String, position: Int) -> Int? {
-        guard let inputDescription = model?.modelDescription.outputDescriptionsByName[named] else { return nil }
-        guard inputDescription.type == .multiArray else { return nil }
-        guard let shapeConstraint = inputDescription.multiArrayConstraint else { return nil }
-        let shape = shapeConstraint.shape.map { $0.intValue }
-        return shape[position]
-    }
-
-    // MARK: Private
-
     internal static func tokenizerNameForVariant(_ variant: ModelVariant) -> String {
         var tokenizerName: String
         switch variant {
@@ -263,29 +203,3 @@ public struct ModelUtilities {
     }
 }
 
-@available(*, deprecated, message: "Subject to removal in a future version. Use `ModelUtilities.loadTokenizer(for:pretrained:tokenizerFolder:useBackgroundSession:)` instead.")
-public func loadTokenizer(
-    for pretrained: ModelVariant,
-    tokenizerFolder: URL? = nil,
-    useBackgroundSession: Bool = false
-) async throws -> WhisperTokenizer {
-    return try await ModelUtilities.loadTokenizer(for: pretrained, tokenizerFolder: tokenizerFolder, useBackgroundSession: useBackgroundSession)
-}
-
-@available(*, deprecated, message: "Subject to removal in a future version. Use ModelUtilities.modelSupport(for:from:) -> ModelSupport instead.")
-public func modelSupport(for deviceName: String, from config: ModelSupportConfig? = nil) -> ModelSupport {
-    return ModelUtilities.modelSupport(for: deviceName, from: config)
-}
-
-@available(*, deprecated, message: "Subject to removal in a future version. Use ModelUtilities.modelSupport(for:from:) -> ModelSupport instead.")
-@_disfavoredOverload
-public func modelSupport(for deviceName: String, from config: ModelSupportConfig? = nil) -> (default: String, disabled: [String]) {
-    let modelSupport = ModelUtilities.modelSupport(for: deviceName, from: config)
-    return (modelSupport.default, modelSupport.disabled)
-}
-
-@available(*, deprecated, message: "Subject to removal in a future version. Use `ModelUtilities.detectModelURL(inFolder:named:)` instead.")
-public func detectModelURL(inFolder path: URL, named modelName: String) -> URL {
-    return ModelUtilities.detectModelURL(inFolder: path, named: modelName)
-    
-}

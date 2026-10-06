@@ -2,7 +2,7 @@
 //  Copyright © 2024 Argmax, Inc. All rights reserved.
 
 import Accelerate
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreAudio
 import CoreML
 
@@ -12,7 +12,7 @@ public typealias DeviceID = AudioDeviceID
 #else
 public typealias DeviceID = String
 #endif
-public typealias ChannelMode = AudioInputConfig.ChannelMode
+public typealias ChannelMode = AudioInputOptions.ChannelMode
 
 public struct AudioDevice: Identifiable, Hashable, Sendable {
     public let id: DeviceID
@@ -25,7 +25,7 @@ public struct AudioDevice: Identifiable, Hashable, Sendable {
 }
 
 /// Configuration for audio input including device selection and channel processing options.
-public struct AudioInputConfig: Sendable {
+public struct AudioInputOptions: Sendable {
     /// Specifies how to handle audio channels when processing multi-channel audio.
     public enum ChannelMode: Hashable, Codable, Sendable {
         /// Selects a single specific channel by index.
@@ -41,10 +41,47 @@ public struct AudioInputConfig: Sendable {
         case sumChannels([Int]?)
     }
 
+    /// Controls how audio files are loaded and processed during transcription.
+    public enum AudioLoadingMode: Sendable {
+        /// Default seconds of audio read per staging step.
+        public static let defaultChunkDurationSeconds: Double = 120
+
+        /// Default number of chunks buffered ahead of the consumer before back-pressure pauses
+        /// loading.
+        public static let defaultMaxBufferedChunks: Int = 2
+
+        /// Loads the whole file into memory before transcribing (default; higher peak memory).
+        case fullFile
+
+        /// Streams the file in bounded-memory chunks. Best for large files.
+        /// - Parameters:
+        ///   - chunkDurationSeconds: Seconds of audio read per staging step.
+        ///   - maxBufferedChunks: Max chunks buffered before back-pressure pauses loading.
+        case incremental(chunkDurationSeconds: Double, maxBufferedChunks: Int)
+
+        /// Incremental loading with the default chunk duration and buffer size.
+        public static let incremental: AudioLoadingMode = .incremental(
+            chunkDurationSeconds: defaultChunkDurationSeconds,
+            maxBufferedChunks: defaultMaxBufferedChunks
+        )
+    }
+
     /// Specifies how to process channels from multi-channel audio sources.
     /// Defaults to summing all channels if not explicitly set.
     public var channelMode: ChannelMode = .sumChannels(nil)
+
+    /// Specifies how audio files are loaded during transcription. Defaults to `.fullFile`.
+    public var audioLoadingMode: AudioLoadingMode = .fullFile
+
+    public init(channelMode: ChannelMode = .sumChannels(nil), audioLoadingMode: AudioLoadingMode = .fullFile) {
+        self.channelMode = channelMode
+        self.audioLoadingMode = audioLoadingMode
+    }
 }
+
+/// Deprecated name for ``AudioInputOptions``.
+@available(*, deprecated, renamed: "AudioInputOptions")
+public typealias AudioInputConfig = AudioInputOptions
 
 public protocol AudioProcessorOutputType {}
 extension MLMultiArray : AudioProcessorOutputType {}
@@ -213,6 +250,12 @@ open class AudioProcessor: NSObject, AudioProcessing {
 
     public var audioBufferCallback: (([Float]) -> Void)?
     public var minBufferLength = Int(Double(WhisperKit.sampleRate) * 0.1) // 0.1 second of audio at 16,000 Hz
+    public private(set) var isInputSuppressed = false
+
+    /// Suppress input buffers by replacing them with silence while keeping timing intact.
+    public func setInputSuppressed(_ isSuppressed: Bool) {
+        isInputSuppressed = isSuppressed
+    }
     
     open func padOrTrim(fromArray audioArray: [Float], startAt startIndex: Int, toLength frameLength: Int) -> (any AudioProcessorOutputType)? {
         return AudioProcessor.padOrTrimAudio(fromArray: audioArray, startAt: startIndex, toLength: frameLength, saveSegment: false)
@@ -263,22 +306,18 @@ open class AudioProcessor: NSObject, AudioProcessing {
         var outputBuffer: AVAudioPCMBuffer?
 
         // If the audio file already meets the desired format, read directly into the output buffer
-        if sampleRate == 16000 && channelCount == 1 {
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
-                throw WhisperError.loadAudioFailed("Unable to create audio buffer")
-            }
+        if sampleRate == Double(WhisperKit.sampleRate) && channelCount == 1 {
             do {
-                try audioFile.read(into: buffer, frameCount: frameCount)
+                outputBuffer = try audioFile.readFully(frameCount: frameCount)
             } catch {
                 throw WhisperError.loadAudioFailed("Failed to read audio file: \(error)")
             }
-            outputBuffer = buffer
         } else {
             // Audio needs resampling to 16khz
             let maxReadSize = maxReadFrameSize ?? Constants.defaultAudioReadFrameSize
             outputBuffer = resampleAudio(
                 fromFile: audioFile,
-                toSampleRate: 16000,
+                toSampleRate: Double(WhisperKit.sampleRate),
                 channelCount: 1,
                 channelMode: channelMode,
                 frameCount: frameCount,
@@ -1004,7 +1043,8 @@ public extension AudioProcessor {
                 }
             }
 
-            let newBufferArray = Self.convertBufferToArray(buffer: buffer)
+            var newBufferArray = Self.convertBufferToArray(buffer: buffer)
+            self.suppressInputIfNeeded(&newBufferArray)
             self.processBuffer(newBufferArray)
         }
 
@@ -1038,9 +1078,10 @@ public extension AudioProcessor {
     /// Recording stops automatically when the stream terminates.
     func startStreamingRecordingLive(inputDeviceID: DeviceID? = nil) -> (AsyncThrowingStream<[Float], Error>, AsyncThrowingStream<[Float], Error>.Continuation) {
         let (stream, continuation) = AsyncThrowingStream<[Float], Error>.makeStream(bufferingPolicy: .unbounded)
-        
-        continuation.onTermination = { [weak self] _ in
-            guard let self = self else { return }
+
+        let weakSelf = WeakSendableWrapper(self)
+        continuation.onTermination = { _ in
+            guard let self = weakSelf.value else { return }
             self.audioBufferCallback = nil
             self.stopRecording()
         }
@@ -1076,13 +1117,62 @@ public extension AudioProcessor {
     }
 
     func stopRecording() {
-        // Remove the tap on any attached node
-        audioEngine?.attachedNodes.forEach { node in
+        guard let engine = audioEngine else { return }
+
+        // Remove tap from the input node explicitly.
+        engine.inputNode.removeTap(onBus: 0)
+
+        engine.attachedNodes.forEach { node in
             node.removeTap(onBus: 0)
         }
 
-        // Stop the audio engine
-        audioEngine?.stop()
+        // Disconnect the input to force the engine graph to fully tear down.
+        // This helps prevent lingering input connections across repeated start/stop cycles.
+        engine.disconnectNodeInput(engine.inputNode)
+
+        engine.stop()
+
+        // Reset clears the engine/node state so a subsequent start builds a fresh graph.
+        engine.reset()
+
         audioEngine = nil
+    }
+
+    func suppressInputIfNeeded(_ buffer: inout [Float]) {
+        guard isInputSuppressed else { return }
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_vclr(base, 1, vDSP_Length(ptr.count))
+        }
+    }
+}
+
+private extension AVAudioFile {
+    /// Reads `frameCount` frames into a new buffer, continuing past short reads until the request
+    /// is satisfied or the file ends. Some inputs (observed with 32-bit float PCM near end-of-file)
+    /// return fewer frames than requested from a single `read`, which would otherwise drop frames.
+    func readFully(frameCount: AVAudioFrameCount) throws -> AVAudioPCMBuffer {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: frameCount) else {
+            throw WhisperError.loadAudioFailed("Unable to create audio buffer")
+        }
+        try read(into: buffer, frameCount: frameCount)
+        while buffer.frameLength < frameCount {
+            let framesRemaining = frameCount - buffer.frameLength
+            guard let scratch = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: framesRemaining) else {
+                throw WhisperError.loadAudioFailed("Unable to create audio buffer")
+            }
+            try read(into: scratch, frameCount: framesRemaining)
+            guard scratch.frameLength > 0 else { break }
+            guard let destination = buffer.floatChannelData, let source = scratch.floatChannelData else {
+                throw WhisperError.loadAudioFailed("Audio buffer is missing float channel data")
+            }
+            memcpy(
+                destination[0].advanced(by: Int(buffer.frameLength)),
+                source[0],
+                Int(scratch.frameLength) * MemoryLayout<Float>.size
+            )
+            buffer.frameLength += scratch.frameLength
+        }
+        return buffer
     }
 }

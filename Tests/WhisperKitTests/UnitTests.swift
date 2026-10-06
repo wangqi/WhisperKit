@@ -4,15 +4,14 @@
 import AVFoundation
 import Combine
 import CoreML
-import Hub
 import NaturalLanguage
-import Tokenizers
+import os.lock
 @testable import WhisperKit
 import XCTest
 
 final class UnitTests: XCTestCase {
     override func setUp() async throws {
-        Logging.shared.logLevel = .debug
+        Logging.updateLogLevel(.debug)
     }
 
     // MARK: - Model Loading Test
@@ -361,6 +360,31 @@ final class UnitTests: XCTestCase {
         let paddedSamples = audioProcessor.padOrTrim(fromArray: audioSamples, startAt: 0, toLength: 1600) as! MLMultiArray
         XCTAssertNotNil(paddedSamples, "Failed to trim audio samples")
         XCTAssertEqual(paddedSamples.count, 1600, "Padded or trimmed samples count is not as expected")
+    }
+
+    func testSuppressInputIfNeededMutesBuffer() {
+        let audioProcessor = AudioProcessor()
+        audioProcessor.setInputSuppressed(true)
+        var buffer: [Float] = [0.25, -0.5, 1.0]
+        audioProcessor.suppressInputIfNeeded(&buffer)
+        XCTAssertTrue(buffer.allSatisfy { $0 == 0.0 }, "Suppressed buffer should contain silence")
+    }
+
+    func testSuppressInputIfNeededNoopWhenDisabled() {
+        let audioProcessor = AudioProcessor()
+        audioProcessor.setInputSuppressed(false)
+        var buffer: [Float] = [0.25, -0.5, 1.0]
+        audioProcessor.suppressInputIfNeeded(&buffer)
+        XCTAssertEqual(buffer, [0.25, -0.5, 1.0], "Buffer should remain unchanged when suppression is disabled")
+    }
+
+    func testInputSuppressionToggleState() {
+        let audioProcessor = AudioProcessor()
+        XCTAssertFalse(audioProcessor.isInputSuppressed, "Suppression should be disabled by default")
+        audioProcessor.setInputSuppressed(true)
+        XCTAssertTrue(audioProcessor.isInputSuppressed, "Suppression should be enabled after setting true")
+        audioProcessor.setInputSuppressed(false)
+        XCTAssertFalse(audioProcessor.isInputSuppressed, "Suppression should be disabled after setting false")
     }
 
     func testAudioResample() throws {
@@ -787,6 +811,151 @@ final class UnitTests: XCTestCase {
         let fallback = try XCTUnwrap(decoderOutput.fallback, "Fallback should not be `nil`")
         XCTAssertEqual(fallback.fallbackReason, "firstTokenLogProbThreshold")
         XCTAssertTrue(fallback.needsFallback)
+    }
+
+    // MARK: - Prompt prefill decode loop tests
+
+    func testEOTDuringPromptPrefillIsIgnored() async throws {
+        // An EOT sampled while the prompt is force-fed is a throwaway prediction
+        // and must not complete the segment
+        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext(promptTokens: [200, 201])
+        let specialTokens = decoder.tokenizer!.specialTokens
+
+        // initialPrompt = [startOfPrev, 200, 201, SOT, language, task, noTimestamps]
+        XCTAssertEqual(inputs.initialPrompt.count, 7, "Unexpected prefill prompt shape")
+
+        // The model predicts EOT at every prefill step (as observed with large-v3 turbo),
+        // then two content tokens, then a real EOT.
+        let prefillSteps = inputs.initialPrompt.count - 1
+        decoder.script =
+            Array(repeating: MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true), count: prefillSteps) + [
+                MockTextDecoder.Prediction(token: 100, confident: true),
+                MockTextDecoder.Prediction(token: 101, confident: true),
+                MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true),
+            ]
+
+        let result = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
+
+        XCTAssertEqual(
+            result.tokens,
+            [specialTokens.startOfTranscriptToken, specialTokens.englishToken, specialTokens.transcribeToken, specialTokens.noTimestampsToken, 100, 101, specialTokens.endToken],
+            "Decoding should consume the full prefill and decode the content tokens"
+        )
+        XCTAssertEqual(decoder.predictionCount, inputs.initialPrompt.count + 2, "Decode loop should not stop during prefill")
+    }
+
+    func testEOTDuringPrefixPrefillIsIgnored() async throws {
+        // `prefixTokens` extend the forced prompt the same way `promptTokens` do;
+        // a promptTokens-only guard would miss this path
+        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext(prefixTokens: [300, 301])
+        let specialTokens = decoder.tokenizer!.specialTokens
+
+        // initialPrompt = [SOT, language, task, noTimestamps, 300, 301]
+        XCTAssertEqual(inputs.initialPrompt.count, 6, "Unexpected prefill prompt shape")
+
+        let prefillSteps = inputs.initialPrompt.count - 1
+        decoder.script =
+            Array(repeating: MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true), count: prefillSteps) + [
+                MockTextDecoder.Prediction(token: 100, confident: true),
+                MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true),
+            ]
+
+        let result = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
+
+        XCTAssertEqual(
+            result.tokens,
+            [specialTokens.startOfTranscriptToken, specialTokens.englishToken, specialTokens.transcribeToken, specialTokens.noTimestampsToken, 300, 301, 100, specialTokens.endToken],
+            "Decoding should consume the full prefix prefill and decode the content token"
+        )
+        XCTAssertEqual(decoder.predictionCount, inputs.initialPrompt.count + 1, "Decode loop should not stop during prefill")
+    }
+
+    func testMaxPromptAndPrefixLeaveRoomToSample() async throws {
+        let promptTokens = Array(0..<((Constants.maxTokenContext / 2) - 1))
+        let prefixTokens = Array(500..<(500 + Constants.maxTokenContext / 2))
+        let (_, inputs, _, _, _) = try await MockTextDecoder.makePromptDecodingContext(promptTokens: promptTokens, prefixTokens: prefixTokens)
+
+        XCTAssertEqual(inputs.initialPrompt.count, Constants.maxTokenContext - 2, "Combined prefill should be capped below the decoding window")
+
+        let sotSequenceLength = 4 // SOT, language, task, noTimestamps
+        let expectedPrefixCount = Constants.maxTokenContext - 2 - (1 + promptTokens.count + sotSequenceLength)
+        XCTAssertEqual(
+            Array(inputs.initialPrompt.suffix(expectedPrefixCount)),
+            Array(prefixTokens.suffix(expectedPrefixCount)),
+            "The prefix should keep its suffix when trimmed to the remaining budget"
+        )
+    }
+
+    func testEmptyInitialPromptThrows() async throws {
+        // Caller error must surface as an error, not a trap
+        let (decoder, _, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext()
+        let emptyInputs = try decoder.prepareDecoderInputs(withPrompt: [])
+
+        do {
+            _ = try await decoder.decodeText(from: encoderOutput, using: emptyInputs, sampler: sampler, options: options)
+            XCTFail("Decoding an empty initial prompt should throw")
+        } catch let error as WhisperError {
+            guard case .prepareDecoderInputsFailed = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testEOTAtFirstDecodedTokenCompletesSegment() async throws {
+        // The sample at the last prefill step is the first real prediction (e.g. silence);
+        // a real EOT there must still end the segment immediately
+        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext(promptTokens: [200, 201])
+        let specialTokens = decoder.tokenizer!.specialTokens
+
+        decoder.script = [MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true)]
+
+        let result = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
+
+        XCTAssertEqual(
+            result.tokens,
+            [specialTokens.startOfTranscriptToken, specialTokens.englishToken, specialTokens.transcribeToken, specialTokens.noTimestampsToken, specialTokens.endToken],
+            "A real EOT at the first decoded token should produce an empty segment"
+        )
+        XCTAssertEqual(decoder.predictionCount, inputs.initialPrompt.count, "Decoding should stop exactly at the first decoded token")
+    }
+
+    func testFirstTokenLogProbIgnoresPrefillPredictions() async throws {
+        // Low-confidence throwaway predictions during the forced prompt must not
+        // trigger the firstTokenLogProbThreshold fallback
+        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext(promptTokens: [200, 201], firstTokenLogProbThreshold: -1.5)
+        let specialTokens = decoder.tokenizer!.specialTokens
+
+        // Unconfident throwaway predictions while the prompt is being forced,
+        // then a confident content token and a confident EOT.
+        let prefillSteps = inputs.initialPrompt.count - 1
+        decoder.script =
+            Array(repeating: MockTextDecoder.Prediction(token: 100, confident: false), count: prefillSteps) + [
+                MockTextDecoder.Prediction(token: 100, confident: true),
+                MockTextDecoder.Prediction(token: specialTokens.endToken, confident: true),
+            ]
+
+        let result = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
+
+        XCTAssertNotEqual(result.fallback?.fallbackReason, "firstTokenLogProbThreshold", "Throwaway prefill predictions should not trigger the first token fallback")
+        XCTAssertEqual(
+            result.tokens,
+            [specialTokens.startOfTranscriptToken, specialTokens.englishToken, specialTokens.transcribeToken, specialTokens.noTimestampsToken, 100, specialTokens.endToken],
+            "Decoding should complete normally when the first decoded token is confident"
+        )
+    }
+
+    func testFirstTokenLogProbFallbackFiresOnFirstDecodedToken() async throws {
+        // The fallback must still fire when the first decoded token is low-confidence
+        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext(promptTokens: [200, 201], firstTokenLogProbThreshold: -1.5)
+
+        decoder.script = [MockTextDecoder.Prediction(token: 100, confident: false)]
+
+        let result = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
+
+        let fallback = try XCTUnwrap(result.fallback, "Fallback should not be `nil`")
+        XCTAssertEqual(fallback.fallbackReason, "firstTokenLogProbThreshold")
+        XCTAssertTrue(fallback.needsFallback)
+        XCTAssertEqual(decoder.predictionCount, inputs.initialPrompt.count, "Decoding should stop at the first decoded token")
     }
 
     func testDecodingFallbackInit() throws {
@@ -1350,25 +1519,69 @@ final class UnitTests: XCTestCase {
         XCTAssertEqual(wordTokens, expectedWordTokens, "Word tokens did not match expected output in Unicode split.")
     }
 
+    func testSplitToWordTokensChinese() async throws {
+        let tokenizer = try await ModelUtilities.loadTokenizer(for: .tiny)
+
+        // 今天天气很好，我们来做个测试吧？
+        let tokenIds = [50364, 12074, 6135, 42204, 23801, 171, 120, 234, 15003, 6912, 10907, 7549, 11038, 233, 5233, 243, 6062, 171, 120, 253, 50257]
+        let originalWords = tokenIds.map { tokenizer.convertIdToToken($0) }
+
+        let (words, wordTokens) = tokenizer.splitToWordTokens(tokenIds: tokenIds)
+
+        // NLLanguageRecognizer reports Chinese as "zh-Hans"/"zh-Hant" (BCP-47), which must
+        // normalize to "zh" to hit the no-space-language path, same as Japanese above
+        let expectedWords = ["<|0.00|>", "今天", "天", "气", "很好", "，", "我们", "来", "做", "个", "测", "试", "吧", "？", "<|endoftext|>"]
+        let expectedWordTokens = [[50364], [12074], [6135], [42204], [23801], [171, 120, 234], [15003], [6912], [10907], [7549], [11038, 233], [5233, 243], [6062], [171, 120, 253], [50257]]
+
+        XCTAssertNotEqual(originalWords, words, "Should not directly convert into tokens from ids")
+        XCTAssertEqual(words, expectedWords, "Words did not match expected output in Unicode split.")
+        XCTAssertEqual(wordTokens, expectedWordTokens, "Word tokens did not match expected output in Unicode split.")
+    }
+
+    func testSplitToWordTokensChineseTraditional() async throws {
+        let tokenizer = try await ModelUtilities.loadTokenizer(for: .tiny)
+
+        // 今天天氣很好，我們來做個測試吧？
+        let tokenIds = [50364, 12074, 6135, 24090, 23801, 171, 120, 234, 5884, 3763, 10907, 3338, 9592, 105, 22099, 6062, 171, 120, 253, 50257]
+        let originalWords = tokenIds.map { tokenizer.convertIdToToken($0) }
+
+        let (words, wordTokens) = tokenizer.splitToWordTokens(tokenIds: tokenIds)
+
+        // Traditional Chinese (zh-Hant) must also normalize to "zh" to hit the no-space-language path.
+        // First, conservative guard assertions that don't depend on specific CFStringTokenizer output:
+        XCTAssertNotEqual(originalWords, words, "Traditional Chinese must hit the no-space split path, not fall back to 1:1 token mapping")
+        let flattenedTokens = wordTokens.flatMap { $0 }
+        XCTAssertEqual(tokenIds, flattenedTokens, "Split must preserve all input tokens without reordering")
+
+        // Then, exact match against known-good split output (same pattern as Simplified Chinese test):
+        let expectedWords = ["<|0.00|>", "今天", "天", "氣", "很好", "，", "我們", "來", "做", "個", "測", "試", "吧", "？", "<|endoftext|>"]
+        let expectedWordTokens = [[50364], [12074], [6135], [24090], [23801], [171, 120, 234], [5884], [3763], [10907], [3338], [9592, 105], [22099], [6062], [171, 120, 253], [50257]]
+
+        XCTAssertEqual(words, expectedWords, "Words did not match expected output in Unicode split.")
+        XCTAssertEqual(wordTokens, expectedWordTokens, "Word tokens did not match expected output in Unicode split.")
+    }
+
     // MARK: - Options Tests
 
     func testSampleLength() async throws {
         let desiredDecodingLoops = 5
-        let targetTokenCount = 7 // Account for the first token and the end of transcript token, which dont require decoding loops
 
-        let options = [
-            DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: false, skipSpecialTokens: false),
-            DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: true, skipSpecialTokens: false),
-            DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: false, skipSpecialTokens: true),
-            DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: true, skipSpecialTokens: true),
+        // Expected length = prefill + sampleLength + EOT
+        let optionsAndExpectedCounts = [
+            (DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: false, skipSpecialTokens: false), 1 + desiredDecodingLoops + 1),
+            (DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: true, skipSpecialTokens: false), 4 + desiredDecodingLoops + 1),
+            (DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: false, skipSpecialTokens: true), 1 + desiredDecodingLoops + 1),
+            (DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: true, skipSpecialTokens: true), 4 + desiredDecodingLoops + 1),
+            // A prompt is prefill, not sampling, so it must not shrink the output
+            (DecodingOptions(sampleLength: desiredDecodingLoops, usePrefillPrompt: true, skipSpecialTokens: false, promptTokens: [1000, 1001, 1002]), 4 + desiredDecodingLoops + 1),
         ]
 
-        for option in options {
+        for (option, expectedTokenCount) in optionsAndExpectedCounts {
             let result = try await XCTUnwrapAsync(
                 await transcribe(with: .tiny, options: option),
                 "Failed to transcribe"
             )
-            XCTAssertEqual(result.segments.first?.tokens.count, targetTokenCount)
+            XCTAssertEqual(result.segments.first?.tokens.count, expectedTokenCount)
         }
     }
 
@@ -1677,6 +1890,25 @@ final class UnitTests: XCTestCase {
         XCTAssertFalse(result.text.contains(promptText), "Prompt text should not be present in the result")
     }
 
+    func testEmptyPromptTokens() async throws {
+        // Empty prompts, including ones reduced to nothing by the special-token filter,
+        // should transcribe exactly like a promptless run
+        let baseline = try await XCTUnwrapAsync(
+            await transcribe(with: .tiny, options: DecodingOptions(skipSpecialTokens: true)),
+            "Failed to transcribe"
+        )
+        XCTAssertFalse(baseline.text.isEmpty)
+
+        let specialOnlyPrompt = [50365] // above specialTokenBegin, filtered out during prefill
+        for promptTokens in [[Int](), specialOnlyPrompt] {
+            let result = try await XCTUnwrapAsync(
+                await transcribe(with: .tiny, options: DecodingOptions(skipSpecialTokens: true, promptTokens: promptTokens)),
+                "Failed to transcribe"
+            )
+            XCTAssertEqual(result.text, baseline.text, "promptTokens \(promptTokens) should not change the transcription")
+        }
+    }
+
     func testPrefixTokens() async throws {
         let config = WhisperKitConfig(model: "tiny", verbose: true, logLevel: .debug, load: true)
         let whisperKit = try await WhisperKit(config)
@@ -1735,7 +1967,12 @@ final class UnitTests: XCTestCase {
         guard #available(macOS 15, iOS 18, watchOS 11, visionOS 2, *) else {
             throw XCTSkip("Disabled on macOS 14 and below due to swift concurrency flakiness")
         }
-        
+
+        let audioFilePath = try XCTUnwrap(
+            Bundle.current(for: self).path(forResource: "jfk", ofType: "wav"),
+            "Audio file not found"
+        )
+
         let callbackTestTask = Task(priority: .userInitiated) {
             let config = WhisperKitConfig(
                 model: "tiny",
@@ -1746,10 +1983,6 @@ final class UnitTests: XCTestCase {
             let whisperKit = try await WhisperKit(config)
 
             try await whisperKit.loadModels()
-            let audioFilePath = try XCTUnwrap(
-                Bundle.current(for: self).path(forResource: "jfk", ofType: "wav"),
-                "Audio file not found"
-            )
 
             let earlyStopTokenCount = 10
             let continuationCallback: TranscriptionCallback = { (progress: TranscriptionProgress) -> Bool? in
@@ -1808,12 +2041,14 @@ final class UnitTests: XCTestCase {
         segmentExpectation.expectedFulfillmentCount = 3 // Expect at least 3 segment callbacks
 
         // Keep track of discovered segments
-        var discoveredSegments = [[TranscriptionSegment]]()
+        let discoveredSegments = OSAllocatedUnfairLock(initialState: [[TranscriptionSegment]]())
 
         // Set up segment discovery callback
         whisperKit.segmentDiscoveryCallback = { segments in
             Logging.debug("Segments discovered with ids: \(segments.map { $0.id }) and seek: \(segments.map { $0.seek })")
-            discoveredSegments.append(segments)
+            discoveredSegments.withLock { state in
+                state.append(segments)
+            }
             segmentExpectation.fulfill()
         }
 
@@ -1834,10 +2069,11 @@ final class UnitTests: XCTestCase {
         await fulfillment(of: [segmentExpectation], timeout: 1)
 
         // Verify segments were discovered across multiple chunks
-        XCTAssertGreaterThanOrEqual(discoveredSegments.count, 3, "Should have discovered segments in multiple chunks")
+        let discoveredSegmentsSnapshot = discoveredSegments.withLock { $0 }
+        XCTAssertGreaterThanOrEqual(discoveredSegmentsSnapshot.count, 3, "Should have discovered segments in multiple chunks")
 
         // Verify that segments have different seek positions
-        let allSeekPositions = Set(discoveredSegments.flatMap { $0.map { $0.seek } })
+        let allSeekPositions = Set(discoveredSegmentsSnapshot.flatMap { $0.map { $0.seek } })
         XCTAssertGreaterThanOrEqual(allSeekPositions.count, 3, "Should have segments with different seek positions")
 
         // Verify that the seek positions are sensible (not negative)
@@ -1846,7 +2082,7 @@ final class UnitTests: XCTestCase {
         }
 
         // Verify that segment times are reasonable
-        let allSegments = discoveredSegments.flatMap { $0 }
+        let allSegments = discoveredSegmentsSnapshot.flatMap { $0 }
         for segment in allSegments {
             XCTAssertGreaterThanOrEqual(segment.start, 0, "Segment start time should not be negative")
             XCTAssertGreaterThan(segment.end, segment.start, "Segment end time should be greater than start time")
@@ -1874,21 +2110,21 @@ final class UnitTests: XCTestCase {
 
     func testFillIndexesWithValue() throws {
         let logits = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
-        logits.fill(indexes: [] as [[NSNumber]], with: -FloatType.infinity)
+        logits.fill(indexes: [] as [[Int]], with: -FloatType.infinity)
         XCTAssertEqual(logits.data(for: 2), [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
 
         let logits2 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
-        let indexes2: [[NSNumber]] = [[0, 0, 0], [0, 0, 1], [0, 0, 5]]
+        let indexes2: [[Int]] = [[0, 0, 0], [0, 0, 1], [0, 0, 5]]
         logits2.fill(indexes: indexes2, with: -FloatType.infinity)
-        XCTAssertEqual(logits2.data(for: 2), [-.infinity, -.infinity, 0.3, 0.4, 0.5, -.infinity, 0.7])
+        XCTAssertEqual(logits2.data(for: 2), [-FloatType.infinity, -FloatType.infinity, 0.3, 0.4, 0.5, -FloatType.infinity, 0.7])
 
         let logits3 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         logits3.fillLastDimension(indexes: 0..<1, with: -FloatType.infinity)
-        XCTAssertEqual(logits3.data(for: 2), [-.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        XCTAssertEqual(logits3.data(for: 2), [-FloatType.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
 
         let logits4 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         logits4.fillLastDimension(indexes: 2..<5, with: -FloatType.infinity)
-        XCTAssertEqual(logits4.data(for: 2), [0.1, 0.2, -.infinity, -.infinity, -.infinity, 0.6, 0.7])
+        XCTAssertEqual(logits4.data(for: 2), [0.1, 0.2, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, 0.6, 0.7])
     }
 
     func testBatchedArray() {
@@ -1960,12 +2196,32 @@ final class UnitTests: XCTestCase {
         let tokensFilter2 = SuppressTokensFilter(suppressTokens: [0])
         let logits2 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result2 = tokensFilter2.filterLogits(logits2, withTokens: [])
-        XCTAssertEqual(result2.data(for: 2), [-.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        XCTAssertEqual(result2.data(for: 2), [-FloatType.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
 
         let tokensFilter3 = SuppressTokensFilter(suppressTokens: [0, 2, 5, 6])
         let logits3 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result3 = tokensFilter3.filterLogits(logits3, withTokens: [])
-        XCTAssertEqual(result3.data(for: 2), [-.infinity, 0.2, -.infinity, 0.4, 0.5, -.infinity, -.infinity])
+        XCTAssertEqual(result3.data(for: 2), [-FloatType.infinity, 0.2, -FloatType.infinity, 0.4, 0.5, -FloatType.infinity, -FloatType.infinity])
+
+        // The -1 sentinel ("suppress the default non-speech tokens") must be
+        // ignored, not written at index -1
+        let tokensFilter4 = SuppressTokensFilter(suppressTokens: [-1])
+        let logits4 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        let result4 = tokensFilter4.filterLogits(logits4, withTokens: [])
+        XCTAssertEqual(result4.data(for: 2), [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+
+        // Out-of-range ids (negative or beyond the vocabulary) are dropped, valid ids still apply
+        let tokensFilter5 = SuppressTokensFilter(suppressTokens: [-1, 0, 7, 100])
+        let logits5 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        let result5 = tokensFilter5.filterLogits(logits5, withTokens: [])
+        XCTAssertEqual(result5.data(for: 2), [-FloatType.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+    }
+
+    func testFillSkipsInvalidIndexes() throws {
+        // Rank-mismatched indexes are skipped rather than written at a partial offset
+        let logits = try MLMultiArray.logits([0.1, 0.2, 0.3])
+        logits.fill(indexes: [[1], [0, 0, 1], [0, 0, 2, 9]], with: -FloatType.infinity)
+        XCTAssertEqual(logits.data(for: 2), [0.1, -FloatType.infinity, 0.3])
     }
 
     func testSuppressBlankFilter() throws {
@@ -1975,7 +2231,7 @@ final class UnitTests: XCTestCase {
         )
         let logits2 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result2 = tokensFilter2.filterLogits(logits2, withTokens: [])
-        XCTAssertEqual(result2.data(for: 2), [-.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        XCTAssertEqual(result2.data(for: 2), [-FloatType.infinity, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
 
         let tokensFilter3 = SuppressBlankFilter(
             specialTokens: .default(endToken: 0, whitespaceToken: 2),
@@ -1983,7 +2239,7 @@ final class UnitTests: XCTestCase {
         )
         let logits3 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result3 = tokensFilter3.filterLogits(logits3, withTokens: [])
-        XCTAssertEqual(result3.data(for: 2), [-.infinity, 0.2, -.infinity, 0.4, 0.5, 0.6, 0.7])
+        XCTAssertEqual(result3.data(for: 2), [-FloatType.infinity, 0.2, -FloatType.infinity, 0.4, 0.5, 0.6, 0.7])
 
         let tokensFilter4 = SuppressBlankFilter(
             specialTokens: .default(endToken: 0, whitespaceToken: 2),
@@ -1991,7 +2247,7 @@ final class UnitTests: XCTestCase {
         )
         let logits4 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result4 = tokensFilter4.filterLogits(logits4, withTokens: [1, 2, 3])
-        XCTAssertEqual(result4.data(for: 2), [-.infinity, 0.2, -.infinity, 0.4, 0.5, 0.6, 0.7])
+        XCTAssertEqual(result4.data(for: 2), [-FloatType.infinity, 0.2, -FloatType.infinity, 0.4, 0.5, 0.6, 0.7])
 
         let tokensFilter5 = SuppressBlankFilter(
             specialTokens: .default(endToken: 0, whitespaceToken: 2),
@@ -2006,7 +2262,7 @@ final class UnitTests: XCTestCase {
         let tokensFilter1 = LanguageLogitsFilter(allLanguageTokens: [2, 4, 6], logitsDim: 7, sampleBegin: 0)
         let logits1 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         let result1 = tokensFilter1.filterLogits(logits1, withTokens: [])
-        XCTAssertEqual(result1.data(for: 2), [-.infinity, -.infinity, 0.3, -.infinity, 0.5, -.infinity, 0.7])
+        XCTAssertEqual(result1.data(for: 2), [-FloatType.infinity, -FloatType.infinity, 0.3, -FloatType.infinity, 0.5, -FloatType.infinity, 0.7])
 
         let tokensFilter2 = LanguageLogitsFilter(allLanguageTokens: [2, 4, 6], logitsDim: 7, sampleBegin: 2)
         let logits2 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
@@ -2032,22 +2288,22 @@ final class UnitTests: XCTestCase {
         // noTimestampToken should always be suppressed if tokens pass sampleBegin
         let logits1 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result1 = tokensFilter.filterLogits(logits1, withTokens: [4])
-        XCTAssertEqual(result1.data(for: 2), [1.1, 5.2, -.infinity, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
+        XCTAssertEqual(result1.data(for: 2), [1.1, 5.2, -FloatType.infinity, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
 
         // Timestamps should not decrease (filters up to last seen timestamp)
         let logits2 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result2 = tokensFilter.filterLogits(logits2, withTokens: [0, 6, 7, 3])
-        XCTAssertEqual(result2.data(for: 2), [1.1, 5.2, -.infinity, 0.4, 0.2, 0.1, -.infinity, -.infinity, 0.1])
+        XCTAssertEqual(result2.data(for: 2), [1.1, 5.2, -FloatType.infinity, 0.4, 0.2, 0.1, -FloatType.infinity, -FloatType.infinity, 0.1])
 
         // If last two tokens are timestamps, filter all timestamps (allows text token to be next)
         let logits3 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result3 = tokensFilter.filterLogits(logits3, withTokens: [0, 6, 7])
-        XCTAssertEqual(result3.data(for: 2), [1.1, 5.2, -.infinity, 0.4, 0.2, 0.1, -.infinity, -.infinity, -.infinity])
+        XCTAssertEqual(result3.data(for: 2), [1.1, 5.2, -FloatType.infinity, 0.4, 0.2, 0.1, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity])
 
         // If only one previous token was a timestamp, filter all text and non-decreasing timestamps (to find matching timestamp pair)
         let logits4 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result4 = tokensFilter.filterLogits(logits4, withTokens: [0, 4, 7])
-        XCTAssertEqual(result4.data(for: 2), [-.infinity, -.infinity, -.infinity, -.infinity, -.infinity, -.infinity, -.infinity, 0.1, 0.1])
+        XCTAssertEqual(result4.data(for: 2), [-FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, 0.1, 0.1])
     }
 
     func testTimestampRulesFilterMultilingual() throws {
@@ -2073,17 +2329,17 @@ final class UnitTests: XCTestCase {
         // Timestamps should not decrease after task token (filters up to last seen timestamp)
         let logits2 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result2 = tokensFilter.filterLogits(logits2, withTokens: [0, 4, 6, 7, 3])
-        XCTAssertEqual(result2.data(for: 2), [1.1, 5.2, -.infinity, 0.4, 0.2, 0.1, -.infinity, -.infinity, 0.1])
+        XCTAssertEqual(result2.data(for: 2), [1.1, 5.2, -FloatType.infinity, 0.4, 0.2, 0.1, -FloatType.infinity, -FloatType.infinity, 0.1])
 
         // If last two tokens after task are timestamps, filter all timestamps (allows text token to be next)
         let logits3 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result3 = tokensFilter.filterLogits(logits3, withTokens: [0, 5, 6, 7])
-        XCTAssertEqual(result3.data(for: 2), [1.1, 5.2, -.infinity, 0.4, 0.2, 0.1, -.infinity, -.infinity, -.infinity])
+        XCTAssertEqual(result3.data(for: 2), [1.1, 5.2, -FloatType.infinity, 0.4, 0.2, 0.1, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity])
 
         // After transcribe token with text and single timestamp (should force timestamp tokens)
         let logits4 = try MLMultiArray.logits([1.1, 5.2, 0.3, 0.4, 0.2, 0.1, 0.2, 0.1, 0.1])
         let result4 = tokensFilter.filterLogits(logits4, withTokens: [0, 4, 0, 7])
-        XCTAssertEqual(result4.data(for: 2), [-.infinity, -.infinity, -.infinity, -.infinity, -.infinity, -.infinity, -.infinity, 0.1, 0.1])
+        XCTAssertEqual(result4.data(for: 2), [-FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, -FloatType.infinity, 0.1, 0.1])
     }
 
     // MARK: - VAD Tests
@@ -2319,7 +2575,7 @@ final class UnitTests: XCTestCase {
         let ptr = UnsafeMutablePointer<Double>(OpaquePointer(mlMatrix.dataPointer))
         for (i, row) in matrix.enumerated() {
             for (j, value) in row.enumerated() {
-                let linearOffset = mlMatrix.linearOffset(for: [i, j] as [NSNumber])
+                let linearOffset = mlMatrix.linearOffset(for: [i, j])
                 ptr[linearOffset] = value
             }
         }
@@ -3006,7 +3262,7 @@ final class UnitTests: XCTestCase {
         )
         let modelPath = try await tinyModelPath()
 
-        // .sumChannels is default for AudioInputConfig
+        // .sumChannels is default for AudioInputOptions
         let config = WhisperKitConfig(modelFolder: modelPath, verbose: true, logLevel: .debug)
         let whisperKit = try await WhisperKit(config)
 
@@ -3024,10 +3280,12 @@ final class UnitTests: XCTestCase {
         )
         let modelPath = try await tinyModelPath()
 
-        let config = WhisperKitConfig(modelFolder: modelPath, audioInputConfig: AudioInputConfig(channelMode: .sumChannels([1, 3, 5])), verbose: true, logLevel: .debug)
-        let whisperKit = try await WhisperKit(config)
+        let whisperKit = try await WhisperKit(WhisperKitConfig(modelFolder: modelPath, verbose: true, logLevel: .debug))
 
-        let result: TranscriptionResult = try await whisperKit.transcribe(audioPath: audioPath).first!
+        let result: TranscriptionResult = try await whisperKit.transcribe(
+            audioPath: audioPath,
+            audioInputOptions: AudioInputOptions(channelMode: .sumChannels([1, 3, 5]))
+        ).first!
         let expectedText = "front left"
         let containsExpectedText = result.text.normalized.contains(expectedText)
         XCTAssert(containsExpectedText, "Expected text not found in transcription and the transcription was \(result)")
@@ -3041,10 +3299,12 @@ final class UnitTests: XCTestCase {
         )
         let modelPath = try await tinyModelPath()
 
-        let config = WhisperKitConfig(modelFolder: modelPath, audioInputConfig: AudioInputConfig(channelMode: .specificChannel(0)), verbose: true, logLevel: .debug)
-        let whisperKit = try await WhisperKit(config)
+        let whisperKit = try await WhisperKit(WhisperKitConfig(modelFolder: modelPath, verbose: true, logLevel: .debug))
 
-        let result: TranscriptionResult = try await whisperKit.transcribe(audioPath: audioPath).first!
+        let result: TranscriptionResult = try await whisperKit.transcribe(
+            audioPath: audioPath,
+            audioInputOptions: AudioInputOptions(channelMode: .specificChannel(0))
+        ).first!
         let expectedText = "center"
         let containsExpectedText = result.text.normalized.contains(expectedText)
         XCTAssert(containsExpectedText, "Expected text not found in transcription and the transcription was \(result)")
@@ -3107,12 +3367,11 @@ final class UnitTests: XCTestCase {
         let options = DecodingOptions(
             withoutTimestamps: true,
             suppressBlank: false,
-            supressTokens: []
+            suppressTokens: []
         )
 
         let allFilters = decoder.createLogitsFilters(
             options: options,
-            prefilledIndex: 0,
             initialPromptIndex: 1,
             tokenizer: tokenizer
         )
@@ -3129,12 +3388,11 @@ final class UnitTests: XCTestCase {
         let options = DecodingOptions(
             withoutTimestamps: true,
             suppressBlank: true,
-            supressTokens: []
+            suppressTokens: []
         )
 
         let allFilters = decoder.createLogitsFilters(
             options: options,
-            prefilledIndex: 0,
             initialPromptIndex: 1,
             tokenizer: tokenizer
         )
@@ -3151,12 +3409,11 @@ final class UnitTests: XCTestCase {
         let options = DecodingOptions(
             withoutTimestamps: true,
             suppressBlank: false,
-            supressTokens: [0, 2, 11, 15]  // Mix of tokens < 10 and >= 10
+            suppressTokens: [0, 2, 11, 15]  // Mix of tokens < 10 and >= 10
         )
 
         let allFilters = decoder.createLogitsFilters(
             options: options,
-            prefilledIndex: 0,
             initialPromptIndex: 1,
             tokenizer: tokenizer
         )
@@ -3176,12 +3433,11 @@ final class UnitTests: XCTestCase {
         let options = DecodingOptions(
             withoutTimestamps: false,
             suppressBlank: false,
-            supressTokens: []
+            suppressTokens: []
         )
 
         let allFilters = decoder.createLogitsFilters(
             options: options,
-            prefilledIndex: 0,
             initialPromptIndex: 1,
             tokenizer: tokenizer
         )
@@ -3200,12 +3456,11 @@ final class UnitTests: XCTestCase {
         let options = DecodingOptions(
             withoutTimestamps: false,
             suppressBlank: true,
-            supressTokens: [0, 2, 11, 15]  // Mix of tokens < 10 and >= 10
+            suppressTokens: [0, 2, 11, 15]  // Mix of tokens < 10 and >= 10
         )
 
         let allFilters = decoder.createLogitsFilters(
             options: options,
-            prefilledIndex: 0,
             initialPromptIndex: 1,
             tokenizer: tokenizer
         )
@@ -3216,6 +3471,87 @@ final class UnitTests: XCTestCase {
         XCTAssertTrue(allFilters[1] is SuppressBlankFilter)
         XCTAssertTrue(allFilters[2] is SuppressTokensFilter)
         XCTAssertTrue(allFilters[3] is TimestampRulesFilter)
+    }
+
+    // MARK: - PropertyLock Concurrency Tests
+
+    /// Verifies that whole-value replacement on a `@TranscriptionPropertyLock`
+    /// property is safe: each worker writes a distinct value and the final read
+    /// always returns one of those values.
+    func testPropertyLockWholeValueReplacementIsSafe() async {
+        final class IntHolder: @unchecked Sendable {
+            @TranscriptionPropertyLock var number: Int = 0
+        }
+
+        let workerCount = max(2, ProcessInfo.processInfo.activeProcessorCount * 2)
+        let holder = IntHolder()
+
+        await withTaskGroup(of: Void.self) { group in
+            for workerIndex in 0..<workerCount {
+                group.addTask {
+                    for _ in 0..<10_000 {
+                        holder.number = workerIndex
+                    }
+                }
+            }
+        }
+
+        let finalValue = holder.number
+        XCTAssertTrue((0..<workerCount).contains(finalValue), "Final value \(finalValue) is outside the valid range [0, \(workerCount))")
+    }
+
+    /// Verifies that sub-property mutations on a reference-type value are not
+    /// protected by `PropertyLock`. The lock only covers get/set of the reference
+    /// itself; mutations on the returned object (e.g. `holder.ref.count += 1`)
+    /// happen entirely outside the lock and lose updates under contention.
+    func testPropertyLockSubPropertyMutationIsUnsafe() async throws {
+        throw XCTSkip("Known limitation - see PropertyLock documentation for details")
+        
+        final class Counter: Codable, @unchecked Sendable {
+            var count: Int = 0
+        }
+        final class Holder: @unchecked Sendable {
+            @TranscriptionPropertyLock var ref = Counter()
+        }
+
+        let workerCount = max(2, ProcessInfo.processInfo.activeProcessorCount * 2)
+        let iterationsPerWorker = 50_000
+        let expected = workerCount * iterationsPerWorker
+        let holder = Holder()
+
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<workerCount {
+                group.addTask {
+                    for _ in 0..<iterationsPerWorker {
+                        holder.ref.count += 1  // unsafe: lock is not held during mutation
+                    }
+                }
+            }
+        }
+
+        let actual = holder.ref.count
+        XCTAssertEqual(actual, expected, "Lost \(expected - actual) updates due to race on ref.count")
+    }
+
+    /// Verifies that `PropertyLock` round-trips correctly through `Codable`
+    /// encoding and decoding without corrupting the protected value.
+    func testPropertyLockCodableRoundTrip() throws {
+        final class Wrapper: Codable {
+            @TranscriptionPropertyLock var text: String
+            @TranscriptionPropertyLock var count: Int
+
+            init(text: String, count: Int) {
+                self.text = text
+                self.count = count
+            }
+        }
+
+        let original = Wrapper(text: "hello", count: 42)
+        let encoded = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(Wrapper.self, from: encoded)
+
+        XCTAssertEqual(decoded.text, original.text)
+        XCTAssertEqual(decoded.count, original.count)
     }
 
 }

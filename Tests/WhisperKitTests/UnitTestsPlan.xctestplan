@@ -15,6 +15,43 @@
   },
   "testTargets" : [
     {
+      "target" : {
+        "containerPath" : "container:",
+        "identifier" : "ArgmaxCoreTests",
+        "name" : "ArgmaxCoreTests"
+      }
+    },
+    {
+      "target" : {
+        "containerPath" : "container:",
+        "identifier" : "SpeakerKitTests",
+        "name" : "SpeakerKitTests"
+      }
+    },
+    {
+      "skippedTests" : [
+        "TTSKitIntegrationTests",
+        "TTSKitIntegrationTests\/testAllSpeakerVoices()",
+        "TTSKitIntegrationTests\/testBasicShortGeneration()",
+        "TTSKitIntegrationTests\/testConcurrentWorkersBatching()",
+        "TTSKitIntegrationTests\/testDeterministicOutputWithFixedSeed()",
+        "TTSKitIntegrationTests\/testKoreanLanguage()",
+        "TTSKitIntegrationTests\/testLongTextSequentialChunks()",
+        "TTSKitIntegrationTests\/testLongTextUnlimitedConcurrentWorkers()",
+        "TTSKitIntegrationTests\/testNumbersAndPunctuation()",
+        "TTSKitIntegrationTests\/testRealTimeFactorUnderOne()",
+        "TTSKitIntegrationTests\/testSaveAudioRoundTrip()",
+        "TTSKitIntegrationTests\/testSingleWordInput()",
+        "TTSKitIntegrationTests\/testTTSModelProtocolConformance()",
+        "TTSKitIntegrationTests\/testUnicodeAndEmoji()"
+      ],
+      "target" : {
+        "containerPath" : "container:",
+        "identifier" : "TTSKitTests",
+        "name" : "TTSKitTests"
+      }
+    },
+    {
       "skippedTests" : [
         "FunctionalTests",
         "FunctionalTests\/testAsyncImplementation()",

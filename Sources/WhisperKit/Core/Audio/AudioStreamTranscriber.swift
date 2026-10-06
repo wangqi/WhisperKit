@@ -17,7 +17,10 @@ public extension AudioStreamTranscriber {
     }
 }
 
-public typealias AudioStreamTranscriberCallback = (AudioStreamTranscriber.State, AudioStreamTranscriber.State) -> Void
+public typealias AudioStreamTranscriberCallback = @Sendable (
+    AudioStreamTranscriber.State,
+    AudioStreamTranscriber.State
+) -> Void
 
 /// Responsible for streaming audio from the microphone, processing it, and transcribing it in real-time.
 public actor AudioStreamTranscriber {
@@ -36,6 +39,10 @@ public actor AudioStreamTranscriber {
     private let transcribeTask: TranscribeTask
     private let audioProcessor: any AudioProcessing
     private let decodingOptions: DecodingOptions
+    /// Optional input device to capture from. nil = system default input.
+    /// Lets callers stream from a specific device (e.g. a virtual device) instead
+    /// of always using the system default. Passed through to startRecordingLive.
+    private let inputDeviceID: DeviceID?
 
     public init(
         audioEncoder: any AudioEncoding,
@@ -49,6 +56,7 @@ public actor AudioStreamTranscriber {
         silenceThreshold: Float = 0.3,
         compressionCheckWindow: Int = 60,
         useVAD: Bool = true,
+        inputDeviceID: DeviceID? = nil,
         stateChangeCallback: AudioStreamTranscriberCallback?
     ) {
         self.transcribeTask = TranscribeTask(
@@ -67,6 +75,7 @@ public actor AudioStreamTranscriber {
         self.silenceThreshold = silenceThreshold
         self.compressionCheckWindow = compressionCheckWindow
         self.useVAD = useVAD
+        self.inputDeviceID = inputDeviceID
         self.stateChangeCallback = stateChangeCallback
     }
 
@@ -76,11 +85,24 @@ public actor AudioStreamTranscriber {
             Logging.error("Microphone access was not granted.")
             return
         }
+        try await startRecordingAndTranscribing()
+    }
+
+    // Kept separate from the system permission prompt so the recording lifecycle
+    // can also be exercised with an AudioProcessing implementation without a microphone.
+    func startRecordingAndTranscribing() async throws {
         state.isRecording = true
-        try audioProcessor.startRecordingLive { [weak self] _ in
-            Task { [weak self] in
-                await self?.onAudioBufferCallback()
+        do {
+            try audioProcessor.startRecordingLive(inputDeviceID: inputDeviceID) { [weak self] _ in
+                Task { [weak self] in
+                    await self?.onAudioBufferCallback()
+                }
             }
+        } catch {
+            // Reset the flag so a failed start (e.g. an unavailable inputDeviceID)
+            // does not leave the actor stuck in a recording state that blocks retries.
+            state.isRecording = false
+            throw error
         }
         await realtimeLoop()
         Logging.info("Realtime transcription has started")
@@ -98,6 +120,7 @@ public actor AudioStreamTranscriber {
                 try await transcribeCurrentBuffer()
             } catch {
                 Logging.error("Error: \(error.localizedDescription)")
+                stopStreamTranscription()
                 break
             }
         }
@@ -193,7 +216,8 @@ public actor AudioStreamTranscriber {
         var options = decodingOptions
         options.clipTimestamps = [state.lastConfirmedSegmentEndSeconds]
         let checkWindow = compressionCheckWindow
-        return try await transcribeTask.run(audioArray: samples, decodeOptions: options) { [weak self] progress in
+        return try await transcribeTask
+            .run(audioArray: samples, decodeOptions: options) { [options] progress in
             Task { [weak self] in
                 await self?.onProgressCallback(progress)
             }

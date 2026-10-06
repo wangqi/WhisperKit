@@ -1,33 +1,44 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 5.10
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 import Foundation
 
 let package = Package(
-    name: "whisperkit",
+    name: "argmax-oss-swift",
     platforms: [
-        // upgraded to iOS 17 / macOS 14 to match swift-transformers 1.2.0 (Hub/Tokenizers require macOS 14+)
-        // wangqi modified 2026-03-17
-        .iOS(.v17),
-        .macOS(.v14),
+        .iOS(.v16),
+        .macOS(.v13),
         .watchOS(.v10),
         .visionOS(.v1)
     ],
     products: [
         .library(
+            name: "ArgmaxOSS",
+            targets: ["ArgmaxOSS"]
+        ),
+        .library(
             name: "WhisperKit",
             targets: ["WhisperKit"]
         ),
+        .library(
+            name: "TTSKit",
+            targets: ["TTSKit"]
+        ),
+        .library(
+            name: "SpeakerKit",
+            targets: ["SpeakerKit"]
+        ),
+        .executable(
+            name: "argmax-cli",
+            targets: ["ArgmaxCLI"]
+        ),
         .executable(
             name: "whisperkit-cli",
-            targets: ["WhisperKitCLI"]
-        )
+            targets: ["ArgmaxCLI"]
+        ),
     ],
     dependencies: [
-        // updated to 1.2.x to match mlx-swift-lm requirement and resolve version conflict
-        // wangqi modified 2026-03-15
-        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMinor(from: "1.2.0")),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
     ] + (isServerEnabled() ? [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.1"),
@@ -38,37 +49,95 @@ let package = Package(
     ] : []),
     targets: [
         .target(
+            name: "ArgmaxOSS",
+            dependencies: [
+                "ArgmaxCore",
+                "WhisperKit",
+                "TTSKit",
+                "SpeakerKit",
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .target(
+            name: "ArgmaxCore",
+            swiftSettings: swiftSettings()
+        ),
+        .target(
             name: "WhisperKit",
             dependencies: [
-                .product(name: "Hub", package: "swift-transformers"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
-            ]
+                "ArgmaxCore",
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .target(
+            name: "TTSKit",
+            dependencies: [
+                "ArgmaxCore",
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .target(
+            name: "SpeakerKit",
+            dependencies: [
+                "ArgmaxCore",
+                "WhisperKit",
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .testTarget(
+            name: "ArgmaxCoreTests",
+            dependencies: [
+                "ArgmaxCore",
+            ],
+            resources: [
+                .process("External/Resources"),
+            ],
+            swiftSettings: swiftSettings()
         ),
         .testTarget(
             name: "WhisperKitTests",
             dependencies: [
                 "WhisperKit",
-                .product(name: "Hub", package: "swift-transformers"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
-            path: "Tests",
+            exclude: ["UnitTestsPlan.xctestplan"],
             resources: [
-                .process("WhisperKitTests/Resources"),
-            ]
+                .process("Resources"),
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .testTarget(
+            name: "TTSKitTests",
+            dependencies: [
+                "TTSKit"
+            ],
+            swiftSettings: swiftSettings()
+        ),
+        .testTarget(
+            name: "SpeakerKitTests",
+            dependencies: [
+                "SpeakerKit",
+                "WhisperKit",
+            ],
+            resources: [
+                .process("Resources"),
+            ],
+            swiftSettings: swiftSettings()
         ),
         .executableTarget(
-            name: "WhisperKitCLI",
+            name: "ArgmaxCLI",
             dependencies: [
                 "WhisperKit",
+                "TTSKit",
+                "SpeakerKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ] + (isServerEnabled() ? [
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "OpenAPIVapor", package: "swift-openapi-vapor"),
             ] : []),
-            path: "Sources/WhisperKitCLI",
+            path: "Sources/ArgmaxCLI",
             exclude: (isServerEnabled() ? [] : ["Server"]),
-            swiftSettings: (isServerEnabled() ? [.define("BUILD_SERVER_CLI")] : [])
+            swiftSettings: swiftSettings() + (isServerEnabled() ? [.define("BUILD_SERVER_CLI")] : [])
         )
     ],
     swiftLanguageVersions: [.v5]
@@ -81,4 +150,8 @@ func isServerEnabled() -> Bool {
 
     // Default disabled, change to true temporarily for local development
     return false
+}
+
+func swiftSettings() -> [SwiftSetting] {
+    [.enableExperimentalFeature("StrictConcurrency")]
 }
