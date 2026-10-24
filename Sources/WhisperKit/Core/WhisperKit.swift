@@ -170,7 +170,8 @@ open class WhisperKit {
         downloadBase: URL? = nil,
         token: String? = nil,
         remoteConfigName: String = Constants.defaultRemoteConfigName,
-        endpoint: String = Constants.defaultRemoteEndpoint
+        endpoint: String = Constants.defaultRemoteEndpoint,
+        useBackgroundSession: Bool = false
     ) async -> ModelSupport {
         let deviceName = Self.deviceName()
         let config = await Self.fetchModelSupportConfig(
@@ -178,9 +179,10 @@ open class WhisperKit {
             downloadBase: downloadBase,
             token: token,
             remoteConfigName: remoteConfigName,
-            endpoint: endpoint
+            endpoint: endpoint,
+            useBackgroundSession: useBackgroundSession
         )
-        
+
         return ModelUtilities.modelSupport(for: deviceName, from: config)
     }
 
@@ -189,9 +191,10 @@ open class WhisperKit {
         downloadBase: URL? = nil,
         token: String? = nil,
         remoteConfigName: String = Constants.defaultRemoteConfigName,
-        endpoint: String = Constants.defaultRemoteEndpoint
+        endpoint: String = Constants.defaultRemoteEndpoint,
+        useBackgroundSession: Bool = false
     ) async -> ModelSupportConfig {
-        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint)
+        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint, useBackgroundSession: useBackgroundSession)
         let repoRef = HubApiWrapper.Repo(id: repo)
         var modelSupportConfig = Constants.fallbackModelSupportConfig
 
@@ -328,12 +331,15 @@ open class WhisperKit {
                 modelVariant = model
             } else {
                 // Model not specified, fetch remote config to get the recommended default
+                // Propagate useBackgroundDownloadSession so the pre-download config fetch
+                // also runs through the background URLSession when the caller opted in.
                 let modelSupport = await WhisperKit.recommendedRemoteModels(
                     from: repo,
                     downloadBase: downloadBase,
                     token: modelToken,
                     remoteConfigName: remoteConfigName,
-                    endpoint: endpoint
+                    endpoint: endpoint,
+                    useBackgroundSession: useBackgroundDownloadSession
                 )
                 modelVariant = modelSupport.default
             }
@@ -361,6 +367,7 @@ open class WhisperKit {
         try await loadModels(prewarmMode: true)
     }
 
+    /// Override ``loadModelComponents(prewarmMode:)`` to customize model loading.
     open func loadModels(
         prewarmMode: Bool = false
     ) async throws {
@@ -368,6 +375,29 @@ open class WhisperKit {
 
         let modelLoadStart = CFAbsoluteTimeGetCurrent()
 
+        do {
+            try await loadModelComponents(prewarmMode: prewarmMode)
+            if !prewarmMode {
+                try await loadTokenizerIfNeeded()
+            }
+        } catch {
+            await unloadModels()
+            throw error
+        }
+
+        if prewarmMode {
+            modelState = .prewarmed
+            currentTimings.prewarmLoadTime = CFAbsoluteTimeGetCurrent() - modelLoadStart
+            return
+        }
+
+        modelState = .loaded
+        currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart + currentTimings.prewarmLoadTime
+
+        Logging.info("Loaded models in \(String(format: "%.2f", currentTimings.modelLoading))s")
+    }
+
+    open func loadModelComponents(prewarmMode: Bool) async throws {
         guard let path = modelFolder else {
             throw WhisperError.modelsUnavailable("Model folder is not set.")
         }
@@ -431,20 +461,6 @@ open class WhisperKit {
 
             Logging.debug("Loaded audio encoder in \(String(format: "%.2f", currentTimings.encoderLoadTime))s")
         }
-
-        if prewarmMode {
-            modelState = .prewarmed
-            currentTimings.prewarmLoadTime = CFAbsoluteTimeGetCurrent() - modelLoadStart
-            return
-        }
-
-        try await loadTokenizerIfNeeded()
-
-        modelState = .loaded
-
-        currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart + currentTimings.prewarmLoadTime
-
-        Logging.info("Loaded models in \(String(format: "%.2f", currentTimings.modelLoading))s")
     }
 
     open func loadTokenizerIfNeeded() async throws {
@@ -490,18 +506,24 @@ open class WhisperKit {
         Logging.debug("Loaded tokenizer in \(String(format: "%.2f", currentTimings.tokenizerLoadTime))s")
     }
 
+    /// Override ``unloadModelComponents()`` to customize model unloading.
     open func unloadModels() async {
         modelState = .unloading
 
+        await unloadModelComponents()
+        tokenizer = nil
+
+        modelState = .unloaded
+
+        Logging.info("Unloaded all models")
+    }
+
+    open func unloadModelComponents() async {
         for model in [featureExtractor, audioEncoder, textDecoder] {
             if let model = model as? WhisperMLModel {
                 model.unloadModel()
             }
         }
-
-        modelState = .unloaded
-
-        Logging.info("Unloaded all models")
     }
 
     open func clearState() {
