@@ -1,0 +1,1255 @@
+commit 3bb82003d0e724cc8ebb4e66e1630e1441363baf
+Merge: e9a6d11 9f99b5c
+Author: wangqi <wang.qi@qikuyx.com>
+Date:   Sat Oct 24 14:16:30 2026 -0400
+
+    [Upgrade] Merge upstream argmax-oss-swift v0.17.0 into main
+
+commit 9f99b5cb6a907730543823ad271b82532782a899
+Author: Zach Nagengast <zacharynagengast@gmail.com>
+Date:   Sat Oct 10 18:10:21 2026 -0700
+
+    Update github release automations (#552)
+
+diff --git a/.github/workflows/expo-update.yml b/.github/workflows/expo-update.yml
+deleted file mode 100644
+index 0a25742..0000000
+--- a/.github/workflows/expo-update.yml
++++ /dev/null
+@@ -1,57 +0,0 @@
+-# Tested on MacOS with:
+-# act -s COMMITTER_TOKEN="$(gh auth token)" release --container-architecture linux/amd64 -P ubuntu-latest=catthehacker/ubuntu:act-latest -e <(echo '{ "release": { "tag_name": "v0.0.0" }}')
+-name: Update whisper-kit-expo
+-
+-on:
+-  release:
+-    types: [released]
+-
+-jobs:
+-  update-whisperkit:
+-    runs-on: ubuntu-latest
+-    env: 
+-      TAG: ${{ github.event.release.tag_name }}
+-      BRANCH_NAME: update-whisperkit-${{ github.event.release.tag_name }}
+-      GH_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+-    steps:
+-        - name: Checkout whisper-kit-expo
+-          uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 #v4.3.1
+-          with:
+-            repository: seb-sep/whisper-kit-expo
+-            token: ${{ secrets.COMMITTER_TOKEN }}
+-            ref: main
+-        
+-        - name: Setup Node
+-          uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 #v4.4.0
+-          with:
+-            node-version: '20.x'
+-
+-        - name: New branch
+-          run: |
+-            git checkout -b $BRANCH_NAME
+-            echo ${{ github.event.release }}
+-            echo "Release tag is $TAG"
+-        
+-        - name: Update package.json version
+-          run: |
+-            PACKAGE_PATH="package.json"
+-            if [ ! -f "$PACKAGE_PATH" ]; then
+-              echo "Could not find package.json at path: $PACKAGE_PATH."
+-              exit 1
+-            fi
+-            RELEASE_TAG=${TAG#v}
+-            jq --arg newver "$RELEASE_TAG" '.whisperKit.version = $newver' "$PACKAGE_PATH" > tmp.$$.json && mv tmp.$$.json "$PACKAGE_PATH"
+-            cat "$PACKAGE_PATH"
+-
+-        - name: Commit changes
+-          run: |
+-            git config --global user.email "164233781+argmaxincbot@users.noreply.github.com"
+-            git config --global user.name "argmaxincbot"
+-            git add ./package.json
+-            git commit -m "Update WhisperKit to $TAG"
+-            git push origin $BRANCH_NAME
+-        - name: PR with changes
+-          env:
+-            GH_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+-          run: |
+-            gh pr create --title "Update WhisperKit to $TAG" --body "Update WhisperKit to $TAG" --base main --head $BRANCH_NAME
+diff --git a/.github/workflows/homebrew-update.yml b/.github/workflows/homebrew-update.yml
+index 400c2f9..77bf381 100644
+--- a/.github/workflows/homebrew-update.yml
++++ b/.github/workflows/homebrew-update.yml
+@@ -8,7 +8,7 @@ jobs:
+   homebrew:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: mislav/bump-homebrew-formula-action@v3
++      - uses: mislav/bump-homebrew-formula-action@f865c8b0dbebd6e263cc06782a0e974c61cf12d2 #v4.2
+         with:
+           formula-name: whisperkit-cli
+         env:
+
+commit c88f830dbaf1c573e37f823c9c9bd553e4825b20
+Author: Andrey Leonov <aleonov@gmail.com>
+Date:   Fri Oct 9 14:00:57 2026 -0400
+
+    Add overridable model loading hooks to WhisperKit and TTSKit (#553)
+
+diff --git a/Sources/TTSKit/TTSKit.swift b/Sources/TTSKit/TTSKit.swift
+index 9ebb204..e9aa9cb 100644
+--- a/Sources/TTSKit/TTSKit.swift
++++ b/Sources/TTSKit/TTSKit.swift
+@@ -440,6 +440,7 @@ open class TTSKit: @unchecked Sendable {
+     ///
+     /// Expects `config.modelFolder` to be set (call `setupModels` first if needed).
+     /// Mirrors `WhisperKit.loadModels(prewarmMode:)`.
++    /// Override ``loadModelComponents(prewarmMode:)`` to customize model loading.
+     ///
+     /// - Parameter prewarmMode: When `true`, compile models one at a time and discard weights
+     ///   to limit peak memory (prewarm). When `false` (default), load all concurrently.
+@@ -447,6 +448,24 @@ open class TTSKit: @unchecked Sendable {
+     open func loadModels(prewarmMode: Bool = false) async throws {
+         modelState = prewarmMode ? .prewarming : .loading
+ 
++        let modelLoadStart = CFAbsoluteTimeGetCurrent()
++
++        do {
++            try await loadModelComponents(prewarmMode: prewarmMode)
++            if !prewarmMode {
++                currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart
++                Logging.info(String(format: "Total model load: %.2fs", modelLoadTime))
++                try await loadTokenizerIfNeeded()
++            }
++        } catch {
++            await unloadModels()
++            throw error
++        }
++
++        modelState = prewarmMode ? .prewarmed : .loaded
++    }
++
++    open func loadModelComponents(prewarmMode: Bool) async throws {
+         let embedUnits = config.computeOptions.embedderComputeUnits
+         let cdUnits = config.computeOptions.codeDecoderComputeUnits
+         let mcdUnits = config.computeOptions.multiCodeDecoderComputeUnits
+@@ -455,7 +474,6 @@ open class TTSKit: @unchecked Sendable {
+         guard let modelFolder = config.modelFolder,
+             FileManager.default.fileExists(atPath: modelFolder.path)
+         else {
+-            modelState = .unloaded
+             throw TTSError.modelNotFound(config.modelFolder?.path ?? "<nil>")
+         }
+ 
+@@ -476,11 +494,6 @@ open class TTSKit: @unchecked Sendable {
+         let mcdURL = try requireURL("multi_code_decoder", config.multiCodeDecoderVariant)
+         let sdURL = try requireURL("speech_decoder", config.speechDecoderVariant)
+ 
+-        // Load tokenizer (skipped in prewarm - only CoreML compilation needed).
+-        if !prewarmMode {
+-            try await loadTokenizerIfNeeded()
+-        }
+-
+         // Propagate Qwen3-specific config to the concrete SpeechDecoder before `loadModel`
+         // selects which function of the multifunction asset to compile.
+         if let qwen3SD = speechDecoder as? Qwen3SpeechDecoder {
+@@ -504,7 +517,6 @@ open class TTSKit: @unchecked Sendable {
+             try await multiCodeDecoder.loadModel(at: mcdURL, computeUnits: mcdUnits, prewarmMode: true)
+             try await speechDecoder.loadModel(at: sdURL, computeUnits: sdUnits, prewarmMode: true)
+             Logging.info(String(format: "Prewarm complete in %.2fs", CFAbsoluteTimeGetCurrent() - modelLoadStart))
+-            modelState = .prewarmed
+         } else {
+             Logging.info("Loading 6 CoreML models concurrently...")
+             Logging.debug("  TextProjector:     \(tpURL.lastPathComponent)  compute: \(embedUnits.description)")
+@@ -522,13 +534,8 @@ open class TTSKit: @unchecked Sendable {
+             async let loadSD: Void = speechDecoder.loadModel(at: sdURL, computeUnits: sdUnits)
+             _ = try await (loadTP, loadCE, loadMCE, loadCD, loadMCD, loadSD)
+ 
+-            currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart
+-
+             // Sync audio output sample rate to the loaded speech decoder.
+             audioOutput.configure(sampleRate: speechDecoder.sampleRate)
+-
+-            Logging.info(String(format: "Total model load: %.2fs", modelLoadTime))
+-            modelState = .loaded
+         }
+     }
+ 
+@@ -571,17 +578,22 @@ open class TTSKit: @unchecked Sendable {
+     ///
+     /// Mirrors `WhisperKit.unloadModels()`. Transitions through `.unloading` before
+     /// reaching `.unloaded` so observers can distinguish the in-progress state.
++    /// Override ``unloadModelComponents()`` to customize model unloading.
+     open func unloadModels() async {
+         modelState = .unloading
++        await unloadModelComponents()
++        tokenizer = nil
++        modelState = .unloaded
++        Logging.info("Unloaded all models")
++    }
++
++    open func unloadModelComponents() async {
+         textProjector.unloadModel()
+         codeEmbedder.unloadModel()
+         multiCodeEmbedder.unloadModel()
+         codeDecoder.unloadModel()
+         multiCodeDecoder.unloadModel()
+         speechDecoder.unloadModel()
+-        tokenizer = nil
+-        modelState = .unloaded
+-        Logging.info("Unloaded all models")
+     }
+ 
+     /// Reset all accumulated timing statistics.
+diff --git a/Sources/WhisperKit/Core/WhisperKit.swift b/Sources/WhisperKit/Core/WhisperKit.swift
+index 3f69fc8..10ae305 100644
+--- a/Sources/WhisperKit/Core/WhisperKit.swift
++++ b/Sources/WhisperKit/Core/WhisperKit.swift
+@@ -367,6 +367,7 @@ open class WhisperKit {
+         try await loadModels(prewarmMode: true)
+     }
+ 
++    /// Override ``loadModelComponents(prewarmMode:)`` to customize model loading.
+     open func loadModels(
+         prewarmMode: Bool = false
+     ) async throws {
+@@ -374,6 +375,29 @@ open class WhisperKit {
+ 
+         let modelLoadStart = CFAbsoluteTimeGetCurrent()
+ 
++        do {
++            try await loadModelComponents(prewarmMode: prewarmMode)
++            if !prewarmMode {
++                try await loadTokenizerIfNeeded()
++            }
++        } catch {
++            await unloadModels()
++            throw error
++        }
++
++        if prewarmMode {
++            modelState = .prewarmed
++            currentTimings.prewarmLoadTime = CFAbsoluteTimeGetCurrent() - modelLoadStart
++            return
++        }
++
++        modelState = .loaded
++        currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart + currentTimings.prewarmLoadTime
++
++        Logging.info("Loaded models in \(String(format: "%.2f", currentTimings.modelLoading))s")
++    }
++
++    open func loadModelComponents(prewarmMode: Bool) async throws {
+         guard let path = modelFolder else {
+             throw WhisperError.modelsUnavailable("Model folder is not set.")
+         }
+@@ -437,20 +461,6 @@ open class WhisperKit {
+ 
+             Logging.debug("Loaded audio encoder in \(String(format: "%.2f", currentTimings.encoderLoadTime))s")
+         }
+-
+-        if prewarmMode {
+-            modelState = .prewarmed
+-            currentTimings.prewarmLoadTime = CFAbsoluteTimeGetCurrent() - modelLoadStart
+-            return
+-        }
+-
+-        try await loadTokenizerIfNeeded()
+-
+-        modelState = .loaded
+-
+-        currentTimings.modelLoading = CFAbsoluteTimeGetCurrent() - modelLoadStart + currentTimings.prewarmLoadTime
+-
+-        Logging.info("Loaded models in \(String(format: "%.2f", currentTimings.modelLoading))s")
+     }
+ 
+     open func loadTokenizerIfNeeded() async throws {
+@@ -496,18 +506,24 @@ open class WhisperKit {
+         Logging.debug("Loaded tokenizer in \(String(format: "%.2f", currentTimings.tokenizerLoadTime))s")
+     }
+ 
++    /// Override ``unloadModelComponents()`` to customize model unloading.
+     open func unloadModels() async {
+         modelState = .unloading
+ 
++        await unloadModelComponents()
++        tokenizer = nil
++
++        modelState = .unloaded
++
++        Logging.info("Unloaded all models")
++    }
++
++    open func unloadModelComponents() async {
+         for model in [featureExtractor, audioEncoder, textDecoder] {
+             if let model = model as? WhisperMLModel {
+                 model.unloadModel()
+             }
+         }
+-
+-        modelState = .unloaded
+-
+-        Logging.info("Unloaded all models")
+     }
+ 
+     open func clearState() {
+diff --git a/Tests/TTSKitTests/TTSKitUnitTests.swift b/Tests/TTSKitTests/TTSKitUnitTests.swift
+index 94b3259..36127cc 100644
+--- a/Tests/TTSKitTests/TTSKitUnitTests.swift
++++ b/Tests/TTSKitTests/TTSKitUnitTests.swift
+@@ -925,6 +925,31 @@ final class TTSKitUnitTests: XCTestCase {
+         XCTAssertNil(tts.tokenizer)
+     }
+ 
++    func testLoadModelsStateWithCustomLoader() async throws {
++        final class CustomLoaderTTSKit: TTSKit, @unchecked Sendable {
++            var shouldFail = false
++            override func loadModelComponents(prewarmMode: Bool) async throws {
++                if shouldFail { throw TTSError.modelNotFound("custom loader failed") }
++            }
++        }
++
++        let tts = try await CustomLoaderTTSKit(TTSKitConfig(download: false, load: false))
++        try await tts.prewarmModels()
++        XCTAssertEqual(tts.modelState, .prewarmed)
++
++        tts.shouldFail = true
++        do {
++            try await tts.loadModels()
++            XCTFail("Expected loadModels to throw")
++        } catch {}
++        XCTAssertEqual(tts.modelState, .unloaded)
++
++        tts.shouldFail = false
++        try await tts.prewarmModels()
++        await tts.unloadModels()
++        XCTAssertEqual(tts.modelState, .unloaded)
++    }
++
+     func testTTSKitComponentsExist() async throws {
+         let tts = try await TTSKit(TTSKitConfig(download: false, load: false))
+         // All components should be initialized (models not loaded yet)
+diff --git a/Tests/WhisperKitTests/UnitTests.swift b/Tests/WhisperKitTests/UnitTests.swift
+index 4e0dade..f046a4f 100644
+--- a/Tests/WhisperKitTests/UnitTests.swift
++++ b/Tests/WhisperKitTests/UnitTests.swift
+@@ -1980,6 +1980,31 @@ final class UnitTests: XCTestCase {
+         XCTAssertEqual(result.segments.first?.text, " and so my fellow americans ask not what your country can do for you ask what you can do for your country")
+     }
+ 
++    func testLoadModelsStateWithCustomLoader() async throws {
++        final class CustomLoaderWhisperKit: WhisperKit {
++            var shouldFail = false
++            override func loadModelComponents(prewarmMode: Bool) async throws {
++                if shouldFail { throw WhisperError.modelsUnavailable("custom loader failed") }
++            }
++        }
++
++        let whisperKit = try await CustomLoaderWhisperKit(WhisperKitConfig(load: false, download: false))
++        try await whisperKit.prewarmModels()
++        XCTAssertEqual(whisperKit.modelState, .prewarmed)
++
++        whisperKit.shouldFail = true
++        do {
++            try await whisperKit.loadModels()
++            XCTFail("Expected loadModels to throw")
++        } catch {}
++        XCTAssertEqual(whisperKit.modelState, .unloaded)
++
++        whisperKit.shouldFail = false
++        try await whisperKit.prewarmModels()
++        await whisperKit.unloadModels()
++        XCTAssertEqual(whisperKit.modelState, .unloaded)
++    }
++
+     func testCallbacks() async throws {
+         let config = WhisperKitConfig(
+             model: "tiny",
+
+commit 93a97e32fa8f6cc5ef36ccaf3d139e19f17d0408
+Author: Zach Nagengast <zacharynagengast@gmail.com>
+Date:   Wed Oct 7 21:18:03 2026 -0700
+
+    Keep the first word after a sentence boundary when chunking TTS text (#548)
+
+diff --git a/Sources/TTSKit/Utilities/TextChunker.swift b/Sources/TTSKit/Utilities/TextChunker.swift
+index dbfc3d5..3391e56 100644
+--- a/Sources/TTSKit/Utilities/TextChunker.swift
++++ b/Sources/TTSKit/Utilities/TextChunker.swift
+@@ -104,9 +104,13 @@ public struct TextChunker {
+                 chunks.append(accepted)
+             }
+ 
++            // Remove trailing whitespace (\s+$ matches the whitespace run at the end of the string),
++            // since BPE tokenizers encode it as part of the next word's token
++            let prefixWithoutTrailingWhitespace = acceptedPrefix.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
++
+             // Re-tokenize the accepted prefix to advance by its exact token count,
+             // avoiding drift from imperfect encode/decode round-trips.
+-            let consumed = encodeText(acceptedPrefix).count
++            let consumed = encodeText(prefixWithoutTrailingWhitespace).count
+             tokens.removeFirst(min(max(consumed, 1), tokens.count))
+         }
+ 
+diff --git a/Tests/TTSKitTests/TTSKitUnitTests.swift b/Tests/TTSKitTests/TTSKitUnitTests.swift
+index a96513a..94b3259 100644
+--- a/Tests/TTSKitTests/TTSKitUnitTests.swift
++++ b/Tests/TTSKitTests/TTSKitUnitTests.swift
+@@ -234,6 +234,38 @@ final class TTSKitUnitTests: XCTestCase {
+         assertReconstructs(chunks, text)
+     }
+ 
++    func testChunkerKeepsFirstWordAfterSentenceBoundaryWithBPETokenizer() {
++        // BPE tokenizers attach a space to the word after it, so the text encodes as
++        // ["One", " two.", " Three", " four."]. The 3-token window "One two. Three" ends its
++        // sentence at "One two. ", which re-encodes as ["One", " two.", " "]. Advancing by
++        // those 3 tokens skips " Three":
++        //
++        //   bad:  ["One two.", "four."]
++        //   good: ["One two.", "Three four."]
++        //
++        let text = "One two. Three four."
++        // Word-level tokenizer: each word after the first is one token with the space before it.
++        // Token IDs index into `pieces`, which grows as encode sees new pieces.
++        var pieces: [String] = []
++        let chunker = TextChunker(
++            targetChunkSize: 3,
++            minChunkSize: 1,
++            encode: { string in
++                var tokens: [Int] = []
++                for (index, word) in string.components(separatedBy: " ").enumerated() {
++                    let piece = index == 0 ? word : " " + word
++                    if !pieces.contains(piece) { pieces.append(piece) }
++                    tokens.append(pieces.firstIndex(of: piece)!)
++                }
++                return tokens
++            },
++            decode: { tokens in tokens.map { pieces[$0] }.joined() }
++        )
++        let chunks = chunker.chunk(text)
++        XCTAssertEqual(chunks, ["One two.", "Three four."])
++        assertReconstructs(chunks, text)
++    }
++
+     // MARK: - Embedding Math
+ 
+     func testZeroEmbed() {
+@@ -1234,11 +1266,6 @@ final class TTSKitUnitTests: XCTestCase {
+     func testChunkerWordBoundaryFallback() {
+         // No punctuation in text - chunker must fall back to word-boundary splits.
+         // With char-level tokenizer, targetChunkSize: 15 gives 15-char windows.
+-        // Note: multi-word phrase checks are intentionally avoided here because the
+-        // re-encode advance can leave a stray char when the token stream has a leading
+-        // space (e.g. "very long" → 9 tokens, but the stream starts with " very lon").
+-        // This is a char-level mock artifact; BPE tokenizers fold whitespace into the
+-        // next word token, so no drift occurs in production.
+         let chunker = makeChunker(targetChunkSize: 15, minChunkSize: 3)
+         let text = "This is a very long text with no punctuation inside it at all here"
+         let chunks = chunker.chunk(text)
+
+commit fd7b63a91f84f374ae39074c851715ccdd1003fc
+Author: Achyut Krishna Byanjankar <115382231+achyutbenz19@users.noreply.github.com>
+Date:   Wed Oct 7 21:13:09 2026 -0700
+
+    WhisperKit : propagate useBackgroundDownloadSession into config fetch (#337) (#461)
+
+diff --git a/Sources/WhisperKit/Core/WhisperKit.swift b/Sources/WhisperKit/Core/WhisperKit.swift
+index 30f8d97..3f69fc8 100644
+--- a/Sources/WhisperKit/Core/WhisperKit.swift
++++ b/Sources/WhisperKit/Core/WhisperKit.swift
+@@ -170,7 +170,8 @@ open class WhisperKit {
+         downloadBase: URL? = nil,
+         token: String? = nil,
+         remoteConfigName: String = Constants.defaultRemoteConfigName,
+-        endpoint: String = Constants.defaultRemoteEndpoint
++        endpoint: String = Constants.defaultRemoteEndpoint,
++        useBackgroundSession: Bool = false
+     ) async -> ModelSupport {
+         let deviceName = Self.deviceName()
+         let config = await Self.fetchModelSupportConfig(
+@@ -178,9 +179,10 @@ open class WhisperKit {
+             downloadBase: downloadBase,
+             token: token,
+             remoteConfigName: remoteConfigName,
+-            endpoint: endpoint
++            endpoint: endpoint,
++            useBackgroundSession: useBackgroundSession
+         )
+-        
++
+         return ModelUtilities.modelSupport(for: deviceName, from: config)
+     }
+ 
+@@ -189,9 +191,10 @@ open class WhisperKit {
+         downloadBase: URL? = nil,
+         token: String? = nil,
+         remoteConfigName: String = Constants.defaultRemoteConfigName,
+-        endpoint: String = Constants.defaultRemoteEndpoint
++        endpoint: String = Constants.defaultRemoteEndpoint,
++        useBackgroundSession: Bool = false
+     ) async -> ModelSupportConfig {
+-        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint)
++        let hubApi = HubApiWrapper(downloadBase: downloadBase, hfToken: token, endpoint: endpoint, useBackgroundSession: useBackgroundSession)
+         let repoRef = HubApiWrapper.Repo(id: repo)
+         var modelSupportConfig = Constants.fallbackModelSupportConfig
+ 
+@@ -328,12 +331,15 @@ open class WhisperKit {
+                 modelVariant = model
+             } else {
+                 // Model not specified, fetch remote config to get the recommended default
++                // Propagate useBackgroundDownloadSession so the pre-download config fetch
++                // also runs through the background URLSession when the caller opted in.
+                 let modelSupport = await WhisperKit.recommendedRemoteModels(
+                     from: repo,
+                     downloadBase: downloadBase,
+                     token: modelToken,
+                     remoteConfigName: remoteConfigName,
+-                    endpoint: endpoint
++                    endpoint: endpoint,
++                    useBackgroundSession: useBackgroundDownloadSession
+                 )
+                 modelVariant = modelSupport.default
+             }
+
+commit adf10e490bffd38b51173370a4bfca6af37bf129
+Author: Zach Nagengast <zacharynagengast@gmail.com>
+Date:   Wed Oct 7 18:39:10 2026 -0700
+
+    Throw instead of crashing when decoding has no logits or sampled tokens (#547)
+
+diff --git a/Sources/WhisperKit/Core/TextDecoder.swift b/Sources/WhisperKit/Core/TextDecoder.swift
+index 4bb9ff6..4baae9f 100644
+--- a/Sources/WhisperKit/Core/TextDecoder.swift
++++ b/Sources/WhisperKit/Core/TextDecoder.swift
+@@ -487,7 +487,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+             )
+         ) as? TextDecoderMLMultiArrayOutputType
+ 
+-        guard let decoderOutput = predictedLogits else {
++        guard let decoderLogits = predictedLogits?.logits else {
+             Logging.error("Unable to decode logits")
+             throw WhisperError.decodingLogitsFailed()
+         }
+@@ -498,7 +498,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+         // MARK: Non-inference
+ 
+         // Update predicted token as current
+-        let logits = languageLogitsFilter.filterLogits(decoderOutput.logits!, withTokens: currentTokens)
++        let logits = languageLogitsFilter.filterLogits(decoderLogits, withTokens: currentTokens)
+ 
+         // MARK: Sampling
+ 
+@@ -506,7 +506,10 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+ 
+         let sampleResult = await tokenSampler.update(tokens: currentTokens, logits: logits, logProbs: logProbs)
+ 
+-        nextToken = sampleResult.tokens.last!
++        guard let sampledToken = sampleResult.tokens.last else {
++            throw WhisperError.decodingFailed("Token sampler returned no tokens")
++        }
++        nextToken = sampledToken
+         logProbs = sampleResult.logProbs
+ 
+         let samplingTime = Date().timeIntervalSince(samplingStartTime)
+@@ -636,7 +639,7 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+                 )
+             ) as? TextDecoderMLMultiArrayOutputType
+ 
+-            guard let decoderOutput = predictedLogits else {
++            guard let decoderOutput = predictedLogits, var logits = decoderOutput.logits else {
+                 throw WhisperError.decodingLogitsFailed("Unable to decode logits")
+             }
+ 
+@@ -648,7 +651,6 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+             let nonInferenceStartTime = Date()
+ 
+             // Update predicted token as current
+-            var logits = decoderOutput.logits!
+             for filter in logitsFilters {
+                 logits = filter.filterLogits(logits, withTokens: currentTokens)
+             }
+@@ -662,8 +664,10 @@ open class TextDecoder: TextDecoding, WhisperMLModel {
+ 
+             let sampleResult = await tokenSampler.update(tokens: currentTokens, logits: logits, logProbs: logProbs)
+ 
+-            nextToken = sampleResult.tokens.last!
+-            let nextTokenLogProb = sampleResult.logProbs.last!
++            guard let sampledToken = sampleResult.tokens.last, let nextTokenLogProb = sampleResult.logProbs.last else {
++                throw WhisperError.decodingFailed("Token sampler returned no tokens or log probabilities")
++            }
++            nextToken = sampledToken
+ 
+             Logging.debug("Predicted next tokenIndex: \(tokenIndex + 1), token: \(nextToken), text: \(tokenizer.decode(tokens: [nextToken]))")
+ 
+diff --git a/Tests/WhisperKitTests/TestUtils.swift b/Tests/WhisperKitTests/TestUtils.swift
+index c216156..cf4c91f 100644
+--- a/Tests/WhisperKitTests/TestUtils.swift
++++ b/Tests/WhisperKitTests/TestUtils.swift
+@@ -449,6 +449,8 @@ final class MockTextDecoder: TextDecoder {
+     /// The last entry repeats if the decode loop runs longer than the script.
+     var script: [Prediction] = []
+     private(set) var predictionCount = 0
++    /// Return an output with no logits, as `TextDecoder` does after `unloadModel()`.
++    var isModelUnloaded = false
+ 
+     private let vocabSize = 1024
+ 
+@@ -461,6 +463,9 @@ final class MockTextDecoder: TextDecoder {
+     override var embedSize: Int? { 2 }
+ 
+     override func predictLogits(_ inputs: TextDecoderInputType) async throws -> TextDecoderOutputType? {
++        if isModelUnloaded {
++            return TextDecoderMLMultiArrayOutputType()
++        }
+         guard !script.isEmpty else {
+             throw WhisperError.decodingLogitsFailed("MockTextDecoder.script is empty; set a script before decoding")
+         }
+diff --git a/Tests/WhisperKitTests/UnitTests.swift b/Tests/WhisperKitTests/UnitTests.swift
+index e6188e6..4e0dade 100644
+--- a/Tests/WhisperKitTests/UnitTests.swift
++++ b/Tests/WhisperKitTests/UnitTests.swift
+@@ -733,6 +733,60 @@ final class UnitTests: XCTestCase {
+ 
+     // MARK: - Decoder Tests
+ 
++    func testDetectLanguageThrowsWhenModelUnloaded() async throws {
++        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext()
++        decoder.isModelUnloaded = true
++
++        do {
++            _ = try await decoder.detectLanguage(from: encoderOutput, using: inputs, sampler: sampler, options: options, temperature: 0)
++            XCTFail("detectLanguage should throw when the model is unloaded")
++        } catch let error as WhisperError {
++            guard case .decodingLogitsFailed = error else {
++                return XCTFail("Unexpected error: \(error)")
++            }
++        }
++    }
++
++    func testDecodeTextThrowsWhenModelUnloaded() async throws {
++        // As when `unloadModels()` lands between iterations of a decode loop that is still running
++        let (decoder, inputs, sampler, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext()
++        decoder.isModelUnloaded = true
++
++        do {
++            _ = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: sampler, options: options)
++            XCTFail("decodeText should throw when the model is unloaded")
++        } catch let error as WhisperError {
++            guard case .decodingLogitsFailed = error else {
++                return XCTFail("Unexpected error: \(error)")
++            }
++        }
++    }
++
++    func testDecodeTextThrowsWhenSamplerReturnsNoTokens() async throws {
++        // A custom sampler that returns an empty result
++        struct EmptySampler: TokenSampling {
++            func update(tokens: [Int], logits: MLMultiArray, logProbs: [Float]) async -> SamplingResult {
++                SamplingResult(tokens: [], logProbs: [], completed: false)
++            }
++
++            func finalize(tokens: [Int], logProbs: [Float]) -> SamplingResult {
++                SamplingResult(tokens: tokens, logProbs: logProbs, completed: true)
++            }
++        }
++
++        let (decoder, inputs, _, encoderOutput, options) = try await MockTextDecoder.makePromptDecodingContext()
++        decoder.script = [MockTextDecoder.Prediction(token: 100, confident: true)]
++
++        do {
++            _ = try await decoder.decodeText(from: encoderOutput, using: inputs, sampler: EmptySampler(), options: options)
++            XCTFail("decodeText should throw when the sampler returns no tokens")
++        } catch let error as WhisperError {
++            guard case .decodingFailed = error else {
++                return XCTFail("Unexpected error: \(error)")
++            }
++        }
++    }
++
+     func testDecoderOutput() async throws {
+         let textDecoder = TextDecoder()
+         let decodingOptions = DecodingOptions()
+
+commit 7ab34834a0e0888fee90899365688c9d493196ee
+Author: Zach Nagengast <zacharynagengast@gmail.com>
+Date:   Wed Oct 7 16:59:52 2026 -0700
+
+    Hugging Face tokens env only, report response code on auth errors (#546)
+
+diff --git a/.github/workflows/development-tests.yml b/.github/workflows/development-tests.yml
+index ff4dd4d..0e8620f 100644
+--- a/.github/workflows/development-tests.yml
++++ b/.github/workflows/development-tests.yml
+@@ -7,8 +7,14 @@ on:
+   workflow_dispatch:
+ 
+ jobs:
++  model-cache:
++    name: "Model Cache"
++    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
++    uses: ./.github/workflows/model-cache.yml
++
+   build-and-test:
+     name: "Build and Test"
++    needs: [model-cache]
+     if: github.event_name != 'pull_request_review'
+     concurrency:
+       group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-build-and-test
+@@ -22,8 +28,10 @@ jobs:
+       visionos-version: "27.0"
+       macos-runner: "xcode-27"
+       xcode-version: "27.0"
++      model-cache-key: ${{ needs.model-cache.outputs.cache-key }}
+ 
+   check-approvals:
++    name: "Check Approvals"
+     if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
+     runs-on: ubuntu-latest
+     outputs:
+@@ -46,7 +54,7 @@ jobs:
+ 
+   pre-merge-tests:
+     name: "Pre-merge Tests"
+-    needs: [check-approvals]
++    needs: [check-approvals, model-cache]
+     if: needs.check-approvals.outputs.reviews == 'APPROVED' || github.event_name == 'workflow_dispatch'
+     concurrency:
+       group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ matrix.os }}
+@@ -75,3 +83,4 @@ jobs:
+       watchos-version: ${{ matrix.watchos-version }}
+       visionos-version: ${{ matrix.visionos-version }}
+       xcode-version: ${{ matrix.xcode-version }}
++      model-cache-key: ${{ needs.model-cache.outputs.cache-key }}
+diff --git a/.github/workflows/model-cache.yml b/.github/workflows/model-cache.yml
+new file mode 100644
+index 0000000..ca40aa4
+--- /dev/null
++++ b/.github/workflows/model-cache.yml
+@@ -0,0 +1,38 @@
++name: Model Cache
++
++on:
++  workflow_call:
++    outputs:
++      cache-key:
++        value: ${{ jobs.models.outputs.cache-key }}
++
++jobs:
++  models:
++    name: "Download Models"
++    runs-on: ubuntu-latest
++    outputs:
++      cache-key: ${{ steps.model-cache.outputs.cache-primary-key }}
++    steps:
++      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd #v5.0.1
++      - name: Get Model Revision
++        id: model-revision
++        run: |
++          sha=$(git ls-remote https://huggingface.co/argmaxinc/whisperkit-coreml HEAD | cut -f1)
++          test -n "$sha"
++          echo "sha=$sha" >> "$GITHUB_OUTPUT"
++      - name: Setup Cache
++        id: model-cache
++        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
++        with:
++          path: Models
++          key: macOS-models-${{ steps.model-revision.outputs.sha }}
++          restore-keys: macOS-models
++      - name: Download Models
++        if: steps.model-cache.outputs.cache-hit != 'true'
++        run: make download-model MODEL=tiny
++      - name: Save Cache
++        if: steps.model-cache.outputs.cache-hit != 'true'
++        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
++        with:
++          path: Models
++          key: ${{ steps.model-cache.outputs.cache-primary-key }}
+diff --git a/.github/workflows/release-tests.yml b/.github/workflows/release-tests.yml
+index ad76993..0611379 100644
+--- a/.github/workflows/release-tests.yml
++++ b/.github/workflows/release-tests.yml
+@@ -6,8 +6,13 @@ on:
+   workflow_dispatch:
+ 
+ jobs:
++  model-cache:
++    name: "Model Cache"
++    uses: ./.github/workflows/model-cache.yml
++
+   build-and-test-all-platforms:
+     name: "Build and Test All Platforms"
++    needs: [model-cache]
+     strategy:
+       matrix:
+         include:
+@@ -38,3 +43,4 @@ jobs:
+       watchos-version: ${{ matrix.watchos-version }}
+       visionos-version: ${{ matrix.visionos-version }}
+       xcode-version: ${{ matrix.xcode-version }}
++      model-cache-key: ${{ needs.model-cache.outputs.cache-key }}
+diff --git a/.github/workflows/unit-tests.yml b/.github/workflows/unit-tests.yml
+index bf33d1e..580c008 100644
+--- a/.github/workflows/unit-tests.yml
++++ b/.github/workflows/unit-tests.yml
+@@ -21,6 +21,9 @@ on:
+       xcode-version:
+         required: false
+         type: string
++      model-cache-key:
++        required: true
++        type: string
+     secrets:
+       HF_TOKEN:
+         required: false
+@@ -66,18 +69,12 @@ jobs:
+           xcode-version: ${{ inputs.xcode-version || '26.4.1' }}
+       - name: Setup environment
+         run: make setup
+-      - name: Get Model Revision
+-        id: model-revision
+-        run: echo "sha=$(git ls-remote https://huggingface.co/argmaxinc/whisperkit-coreml HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+       - name: Setup Cache
+-        id: model-cache
+-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
++        if: ${{ matrix.run-config['condition'] == true }}
++        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
+         with:
+           path: Models
+-          key: ${{ runner.os }}-models-${{ steps.model-revision.outputs.sha }}
+-      - name: Download Models
+-        if: steps.model-cache.outputs.cache-hit != 'true'
+-        run: make download-model MODEL=tiny
++          key: ${{ inputs.model-cache-key }}
+       - name: Install and discover destinations
+         if: ${{ matrix.run-config['condition'] == true }}
+         run: |
+diff --git a/Sources/ArgmaxCore/External/Hub/Downloader.swift b/Sources/ArgmaxCore/External/Hub/Downloader.swift
+index c80cf02..e0c91f0 100644
+--- a/Sources/ArgmaxCore/External/Hub/Downloader.swift
++++ b/Sources/ArgmaxCore/External/Hub/Downloader.swift
+@@ -167,7 +167,8 @@ final class Downloader: NSObject, Sendable {
+                     var requestHeaders = headers ?? [:]
+ 
+                     // Populate header auth and range fields
+-                    if let authToken {
++                    // Argmax-modification: skip the Authorization header for an empty token
++                    if let authToken, !authToken.isEmpty {
+                         requestHeaders["Authorization"] = "Bearer \(authToken)"
+                     }
+ 
+diff --git a/Sources/ArgmaxCore/External/Hub/Hub.swift b/Sources/ArgmaxCore/External/Hub/Hub.swift
+index ffade8a..734d81d 100644
+--- a/Sources/ArgmaxCore/External/Hub/Hub.swift
++++ b/Sources/ArgmaxCore/External/Hub/Hub.swift
+@@ -29,8 +29,9 @@ extension Hub {
+     /// interacting with the Hugging Face Hub, including network issues, authentication
+     /// problems, file system errors, and parsing failures.
+     enum HubClientError: LocalizedError {
+-        /// Authentication is required but no valid token was provided.
+-        case authorizationRequired
++        /// Authentication failed with the given HTTP status code, or no valid token was provided.
++        // Argmax-modification: carries the HTTP status code
++        case authorizationRequired(statusCode: Int?)
+         /// An HTTP error occurred with the specified status code.
+         case httpStatusCode(Int)
+         /// Failed to parse server response or configuration data.
+@@ -57,6 +58,9 @@ extension Hub {
+         // Argmax-modification: removed public — Hub is internal
+         var errorDescription: String? {
+             switch self {
++            // Argmax-modification: include the HTTP status code
++            case let .authorizationRequired(statusCode?):
++                String(localized: "Authentication failed with status code: \(statusCode). Please check your Hugging Face token.")
+             case .authorizationRequired:
+                 String(localized: "Authentication required. Please provide a valid Hugging Face token.")
+             case let .httpStatusCode(code):
+diff --git a/Sources/ArgmaxCore/External/Hub/HubApi.swift b/Sources/ArgmaxCore/External/Hub/HubApi.swift
+index d43e708..f975322 100644
+--- a/Sources/ArgmaxCore/External/Hub/HubApi.swift
++++ b/Sources/ArgmaxCore/External/Hub/HubApi.swift
+@@ -128,28 +128,11 @@ private extension HubApi {
+         ProcessInfo.processInfo.environment["HF_ENDPOINT"] ?? "https://huggingface.co"
+     }
+ 
++    // Argmax-modification: removed the HF_TOKEN_PATH, HF_HOME, ~/.cache/huggingface, and ~/.huggingface token file lookups
+     static func hfTokenFromEnv() -> String? {
+         let possibleTokens = [
+             { ProcessInfo.processInfo.environment["HF_TOKEN"] },
+             { ProcessInfo.processInfo.environment["HUGGING_FACE_HUB_TOKEN"] },
+-            {
+-                ProcessInfo.processInfo.environment["HF_TOKEN_PATH"].flatMap {
+-                    try? String(
+-                        contentsOf: URL(filePath: NSString(string: $0).expandingTildeInPath),
+-                        encoding: .utf8
+-                    )
+-                }
+-            },
+-            {
+-                ProcessInfo.processInfo.environment["HF_HOME"].flatMap {
+-                    try? String(
+-                        contentsOf: URL(filePath: NSString(string: $0).expandingTildeInPath).appending(path: "token"),
+-                        encoding: .utf8
+-                    )
+-                }
+-            },
+-            { try? String(contentsOf: .homeDirectory.appending(path: ".cache/huggingface/token"), encoding: .utf8) },
+-            { try? String(contentsOf: .homeDirectory.appending(path: ".huggingface/token"), encoding: .utf8) },
+         ]
+         return possibleTokens
+             .lazy
+@@ -200,7 +183,7 @@ extension HubApi {
+             case 200..<300:
+                 return (data, httpResponse)
+             case 401, 403:
+-                throw Hub.HubClientError.authorizationRequired
++                throw Hub.HubClientError.authorizationRequired(statusCode: httpResponse.statusCode)
+             case 404:
+                 throw Hub.HubClientError.fileNotFound(url.lastPathComponent)
+             default:
+@@ -236,7 +219,7 @@ extension HubApi {
+ 
+         switch response.statusCode {
+         case 200..<400: break // Allow redirects to pass through to the redirect delegate
+-        case 401, 403: throw Hub.HubClientError.authorizationRequired
++        case 401, 403: throw Hub.HubClientError.authorizationRequired(statusCode: response.statusCode)
+         case 404: throw Hub.HubClientError.fileNotFound(url.lastPathComponent)
+         default: throw Hub.HubClientError.httpStatusCode(response.statusCode)
+         }
+@@ -332,7 +315,7 @@ extension HubApi {
+ /// Whoami
+ extension HubApi {
+     func whoami() async throws -> Config {
+-        guard hfToken != nil else { throw Hub.HubClientError.authorizationRequired }
++        guard hfToken?.isEmpty == false else { throw Hub.HubClientError.authorizationRequired(statusCode: nil) }
+ 
+         let url = URL(string: endpoint)!
+             .appending(path: "api")
+
+commit bdb415df18e7cb2703f2f3b998cd87c431c79809
+Author: Zach Nagengast <zacharynagengast@gmail.com>
+Date:   Wed Oct 7 13:42:08 2026 -0700
+
+    Test on macOS 27, drop macOS 14, and speed up simulator unit tests (#545)
+
+diff --git a/.github/workflows/development-tests.yml b/.github/workflows/development-tests.yml
+index 8479879..ff4dd4d 100644
+--- a/.github/workflows/development-tests.yml
++++ b/.github/workflows/development-tests.yml
+@@ -9,20 +9,22 @@ on:
+ jobs:
+   build-and-test:
+     name: "Build and Test"
++    if: github.event_name != 'pull_request_review'
+     concurrency:
+       group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-build-and-test
+       cancel-in-progress: true
+     uses: ./.github/workflows/unit-tests.yml
+     secrets: inherit
+     with:
+-      ios-version: "26.4.1"
+-      ios-device: "iPhone 17"
+-      watchos-version: "26.4"
+-      visionos-version: "latest"
+-      macos-runner: "macos-26"
+-      xcode-version: "26.4.1"
++      ios-version: "27.0"
++      ios-device: "iPhone 18 Pro"
++      watchos-version: "27.0"
++      visionos-version: "27.0"
++      macos-runner: "xcode-27"
++      xcode-version: "27.0"
+ 
+   check-approvals:
++    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
+     runs-on: ubuntu-latest
+     outputs:
+       reviews: ${{ steps.reviews.outputs.state }}
+@@ -52,18 +54,18 @@ jobs:
+     strategy:
+       matrix:
+         include:
+-          - os: macos-14
+-            ios-version: "17.2"
+-            ios-device: "iPhone 15"
+-            watchos-version: "10.2"
+-            visionos-version: "1.0"
+-            xcode-version: "16.1"
+           - os: macos-15
+             ios-version: "18.5"
+             ios-device: "iPhone 16"
+             watchos-version: "11.5"
+             visionos-version: "2.5"
+             xcode-version: "16.4"
++          - os: macos-26
++            ios-version: "26.5"
++            ios-device: "iPhone 17"
++            watchos-version: "26.5"
++            visionos-version: "latest"
++            xcode-version: "26.6"
+     uses: ./.github/workflows/unit-tests.yml
+     secrets: inherit
+     with:
+diff --git a/.github/workflows/release-tests.yml b/.github/workflows/release-tests.yml
+index e96bb47..ad76993 100644
+--- a/.github/workflows/release-tests.yml
++++ b/.github/workflows/release-tests.yml
+@@ -11,12 +11,6 @@ jobs:
+     strategy:
+       matrix:
+         include:
+-          - os: macos-14
+-            ios-version: "17.5"
+-            ios-device: "iPhone 15"
+-            watchos-version: "10.2"
+-            visionos-version: "1.0"
+-            xcode-version: "16.1"
+           - os: macos-15
+             ios-version: "18.5"
+             ios-device: "iPhone 16"
+@@ -24,12 +18,17 @@ jobs:
+             visionos-version: "2.5"
+             xcode-version: "16.4"
+           - os: macos-26
+-            ios-version: "26.4.1"
++            ios-version: "26.5"
+             ios-device: "iPhone 17"
+-            watchos-version: "26.4"
++            watchos-version: "26.5"
+             visionos-version: "latest"
+-            macos-runner: "macos-26"
+-            xcode-version: "26.4.1"
++            xcode-version: "26.6"
++          - os: xcode-27
++            ios-version: "27.0"
++            ios-device: "iPhone 18 Pro"
++            watchos-version: "27.0"
++            visionos-version: "27.0"
++            xcode-version: "27.0"
+     uses: ./.github/workflows/unit-tests.yml
+     secrets: inherit
+     with:
+diff --git a/.github/workflows/unit-tests.yml b/.github/workflows/unit-tests.yml
+index 7a9a2f7..bf33d1e 100644
+--- a/.github/workflows/unit-tests.yml
++++ b/.github/workflows/unit-tests.yml
+@@ -35,25 +35,27 @@ jobs:
+           - {
+               name: "macOS",
+               condition: true,
+-              clean-destination: "generic/platform=macOS",
+               test-destination: "platform=macOS,arch=arm64",
+             }
+           - {
+               name: "iOS",
+               condition: true,
+-              clean-destination: "generic/platform=iOS",
++              os-version: "${{ inputs.ios-version }}",
++              device: "${{ inputs.ios-device }}",
+               test-destination: "platform=iOS Simulator,OS=${{ inputs.ios-version }},name=${{ inputs.ios-device }}",
+             }
+           - {
+               name: "watchOS",
+-              condition: "${{ inputs.macos-runner == 'macos-26' }}",
+-              clean-destination: "generic/platform=watchOS",
+-              test-destination: "platform=watchOS Simulator,OS=${{ inputs.watchos-version }},name=Apple Watch Ultra 3 (49mm)",
++              condition: "${{ inputs.macos-runner == 'xcode-27' }}",
++              os-version: "${{ inputs.watchos-version }}",
++              device: "Apple Watch Ultra 4 (49mm)",
++              test-destination: "platform=watchOS Simulator,OS=${{ inputs.watchos-version }},name=Apple Watch Ultra 4 (49mm)",
+             }
+           - {
+               name: "visionOS",
+-              condition: "${{ inputs.macos-runner == 'macos-26' }}",
+-              clean-destination: "generic/platform=visionOS",
++              condition: "${{ inputs.macos-runner == 'xcode-27' }}",
++              os-version: "${{ inputs.visionos-version }}",
++              device: "Apple Vision Pro",
+               test-destination: "platform=visionOS Simulator,OS=${{ inputs.visionos-version }},name=Apple Vision Pro",
+             }
+     timeout-minutes: ${{ matrix.run-config['name'] == 'visionOS' && 60 || 30 }}
+@@ -64,12 +66,15 @@ jobs:
+           xcode-version: ${{ inputs.xcode-version || '26.4.1' }}
+       - name: Setup environment
+         run: make setup
++      - name: Get Model Revision
++        id: model-revision
++        run: echo "sha=$(git ls-remote https://huggingface.co/argmaxinc/whisperkit-coreml HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+       - name: Setup Cache
+         id: model-cache
+         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
+         with:
+           path: Models
+-          key: ${{ runner.os }}-models
++          key: ${{ runner.os }}-models-${{ steps.model-revision.outputs.sha }}
+       - name: Download Models
+         if: steps.model-cache.outputs.cache-hit != 'true'
+         run: make download-model MODEL=tiny
+@@ -86,28 +91,34 @@ jobs:
+           echo "Destinations for testing:"
+           xcodebuild test-without-building -testPlan UnitTestsPlan -scheme argmax-oss-swift-Package -showdestinations
+       - name: Boot Simulator and Wait
+-        if: ${{ matrix.run-config['condition'] == true && matrix.run-config['name'] != 'macOS' && inputs.macos-runner == 'macos-26' }}
++        if: ${{ matrix.run-config['condition'] == true && matrix.run-config['name'] != 'macOS' && inputs.macos-runner == 'xcode-27' }}
++        timeout-minutes: 5
++        continue-on-error: true
+         # Slower runners require some time to fully boot the simulator
+-        # Parse the simulator name from the destination string, boot it, and wait
++        # Boot the simulator for the requested OS and device, and wait
++        env:
++          PLATFORM: ${{ matrix.run-config['name'] }}
++          OS: ${{ matrix.run-config['os-version'] }}
++          DEVICE: ${{ matrix.run-config['device'] }}
+         run: |
+-          simulator_name=$(echo '${{ matrix.run-config['test-destination'] }}' | sed -n 's/.*name=\([^,]*\).*/\1/p')
+-          xcrun simctl boot "$simulator_name" || true
+-          sleep 15
+-          xcrun simctl list devices
++          udid=$(xcrun simctl list -j | jq -r '(.runtimes[] | select(.isAvailable and (.name | startswith(env.PLATFORM + " ")) and .version == env.OS) | .identifier) as $runtime | .devices[$runtime][]? | select(.isAvailable and .name == env.DEVICE) | .udid' | head -1)
++          xcrun simctl bootstatus "${udid:-$DEVICE}" -b
+       - name: Build - ${{ matrix.run-config['name'] }}
+         if: ${{ matrix.run-config['condition'] == true }}
+         run: |
+           set -o pipefail
+           # Annotate warnings from a single job only; duplicate check runs each re-post identical annotations on the PR diff
+-          xcodebuild clean build-for-testing -scheme argmax-oss-swift-Package -destination '${{ matrix.run-config['clean-destination'] }}' | xcbeautify --renderer ${{ (matrix.run-config['name'] == 'macOS' && inputs.macos-runner == 'macos-26') && 'github-actions' || 'terminal' }}
++          xcodebuild clean build-for-testing -testPlan UnitTestsPlan -scheme argmax-oss-swift-Package -destination '${{ matrix.run-config['test-destination'] }}' | xcbeautify --renderer ${{ (matrix.run-config['name'] == 'macOS' && inputs.macos-runner == 'xcode-27') && 'github-actions' || 'terminal' }}
++          xcodebuild build -scheme argmax-oss-swift-Package -destination 'generic/platform=${{ matrix.run-config['name'] }}' -derivedDataPath "$RUNNER_TEMP/generic-build" | xcbeautify
+       - name: Test - ${{ matrix.run-config['name'] }}
+         if: ${{ matrix.run-config['condition'] == true }}
+         env:
+-          # xcodebuild strips the TEST_RUNNER_ prefix and forwards HF_TOKEN into the test process
++          # xcodebuild strips the TEST_RUNNER_ prefix and forwards these into the test process
+           TEST_RUNNER_HF_TOKEN: ${{ secrets.HF_TOKEN }}
++          TEST_RUNNER_WHISPERKIT_TINY_MODEL_PATH: ${{ github.workspace }}/Models/whisperkit-coreml/openai_whisper-tiny
+         run: |
+           set -o pipefail
+-          xcodebuild test -testPlan UnitTestsPlan -scheme argmax-oss-swift-Package -destination '${{ matrix.run-config['test-destination'] }}' | xcbeautify
++          xcodebuild test-without-building -testPlan UnitTestsPlan -scheme argmax-oss-swift-Package -destination '${{ matrix.run-config['test-destination'] }}' -collect-test-diagnostics never | xcbeautify
+       - name: Upload Test Results
+         if: failure()
+         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 #v4.6.2
+diff --git a/Tests/SpeakerKitTests/SpeakerCentroidEmbeddingsTests.swift b/Tests/SpeakerKitTests/SpeakerCentroidEmbeddingsTests.swift
+index 8cb8d88..64c674b 100644
+--- a/Tests/SpeakerKitTests/SpeakerCentroidEmbeddingsTests.swift
++++ b/Tests/SpeakerKitTests/SpeakerCentroidEmbeddingsTests.swift
+@@ -374,7 +374,7 @@ final class SpeakerCentroidEmbeddingsTests: XCTestCase {
+ 
+     /// Two identical calls on the same audio must preserve speaker ids and keep centroids close.
+     func testCentroidsStableAcrossReruns() async throws {
+-        let centroidDistanceTolerance: Float = 1e-2
++        let centroidDistanceTolerance: Float = 3e-2
+         let audioArray = try loadAudio(named: "VADAudio")
+         let speakerKit = try await SpeakerKit()
+         let first = try await speakerKit.diarize(audioArray: audioArray)
+diff --git a/Tests/WhisperKitTests/TestUtils.swift b/Tests/WhisperKitTests/TestUtils.swift
+index ef0035e..c216156 100644
+--- a/Tests/WhisperKitTests/TestUtils.swift
++++ b/Tests/WhisperKitTests/TestUtils.swift
+@@ -162,6 +162,11 @@ extension XCTestCase {
+     }
+ 
+     func tinyModelPath() async throws -> String {
++        if let localPath = ProcessInfo.processInfo.environment["WHISPERKIT_TINY_MODEL_PATH"],
++           FileManager.default.fileExists(atPath: localPath)
++        {
++            return localPath
++        }
+         let modelDir = try await WhisperKit.download(variant: "tiny").path()
+         return modelDir
+     }
+
+commit ef41e033c183976a46a39dec8e96dc17f4f0aca8
+Author: Achyut Krishna Byanjankar <115382231+achyutbenz19@users.noreply.github.com>
+Date:   Tue Oct 6 17:32:15 2026 -0700
+
+    TTSKit : guard sampleFromProbs against zero-sum top-k probabilities (#450) (#459)
+
+diff --git a/Sources/TTSKit/Utilities/Sampling.swift b/Sources/TTSKit/Utilities/Sampling.swift
+index aca44e6..29ccbf4 100644
+--- a/Sources/TTSKit/Utilities/Sampling.swift
++++ b/Sources/TTSKit/Utilities/Sampling.swift
+@@ -260,6 +260,10 @@ public class GreedyTokenSampler: TokenSampling, @unchecked Sendable {
+             let probsArray = await topKProbs.toFloatArray()
+             let idxArray = await topKIndices.toIntArray()
+             let probSum = probsArray.reduce(0, +)
++            // Underflow can round every top-k probability to zero, so fall back to the highest one
++            guard probSum > 0 else {
++                return idxArray.first.map(Int32.init) ?? Int32(vocabSize - 1)
++            }
+             let randomValue = Float.random(in: 0..<probSum, using: &rng)
+             var cumulativeSum: Float = 0
+             for (i, probability) in probsArray.enumerated() {
+
+commit 9e496325dd6aff41d370f73f74844739f2b87167
+Author: Andrey Leonov <aleonov@gmail.com>
+Date:   Tue Oct 6 19:07:24 2026 -0400
+
+    Keep metadata requests as HEAD across the Hub's relative redirects (#544)
+
+diff --git a/Sources/ArgmaxCore/External/Hub/HubApi.swift b/Sources/ArgmaxCore/External/Hub/HubApi.swift
+index 99f3f2b..d43e708 100644
+--- a/Sources/ArgmaxCore/External/Hub/HubApi.swift
++++ b/Sources/ArgmaxCore/External/Hub/HubApi.swift
+@@ -936,6 +936,10 @@ private final class RedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable
+                         // Create new request with the resolved URL
+                         if let resolvedUrl = components.url {
+                             var newRequest = URLRequest(url: resolvedUrl)
++                            // Argmax-modification: this delegate only serves httpHead, so the redirected request must
++                            // stay HEAD. URLRequest(url:) defaults to GET, which downloaded every non-LFS file in full
++                            // (the Hub redirects those with a relative 307) just to read its metadata headers.
++                            newRequest.httpMethod = task.originalRequest?.httpMethod
+                             // Copy headers from original request
+                             if let headers = task.originalRequest?.allHTTPHeaderFields {
+                                 for (key, value) in headers {
+diff --git a/Tests/ArgmaxCoreTests/External/Hub/HubApiTests.swift b/Tests/ArgmaxCoreTests/External/Hub/HubApiTests.swift
+index a3f49dd..8c9af86 100644
+--- a/Tests/ArgmaxCoreTests/External/Hub/HubApiTests.swift
++++ b/Tests/ArgmaxCoreTests/External/Hub/HubApiTests.swift
+@@ -56,6 +56,24 @@ final class HubApiTests: XCTestCase {
+         XCTAssertEqual(try Data(contentsOf: repoRoot.appendingPathComponent("weights.bin")), SnapshotHTTPServer.fileData)
+     }
+ 
++    func testMetadataRequestStaysHeadAcrossRelativeRedirect() async throws {
++        let server = try SnapshotHTTPServer()
++        addTeardownBlock { server.stop() }
++        server.start()
++        await fulfillment(of: [server.ready], timeout: 5)
++        let port = try XCTUnwrap(server.port)
++        let hub = HubApi(downloadBase: tempDir, hfToken: "", endpoint: "http://127.0.0.1:\(port)", useOfflineMode: false)
++
++        let metadata = try await hub.getFileMetadata(url: XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/test/redirect/resolve/main/config.json")))
++
++        XCTAssertEqual(metadata.commitHash, SnapshotHTTPServer.commitHash)
++        XCTAssertEqual(metadata.etag, "config-etag")
++        XCTAssertEqual(server.receivedRequests, [
++            "HEAD /test/redirect/resolve/main/config.json",
++            "HEAD /api/resolve-cache/models/test/redirect/config.json",
++        ])
++    }
++
+     private func makePartialSnapshot(name: String) async throws -> (HubApi, HubApi.Repo, URL, XCTestExpectation) {
+         let server = try SnapshotHTTPServer()
+         addTeardownBlock { server.stop() }
+@@ -92,8 +110,10 @@ private final class SnapshotHTTPServer: @unchecked Sendable {
+     private let listener: NWListener
+     private let queue = DispatchQueue(label: "HubApiTests.HTTPServer")
+     private var connections: [NWConnection] = []
++    private var requests: [String] = []
+ 
+     var port: UInt16? { listener.port?.rawValue }
++    var receivedRequests: [String] { queue.sync { requests } }
+ 
+     init() throws {
+         let parameters = NWParameters.tcp
+@@ -152,6 +172,13 @@ private final class SnapshotHTTPServer: @unchecked Sendable {
+         }
+         let method = parts[0]
+         let path = parts[1]
++        requests.append("\(method) \(path)")
++        // Relative redirect, as the Hub returns for non-LFS files.
++        if path == "/test/redirect/resolve/main/config.json" {
++            let headers = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /api/resolve-cache/models/test/redirect/config.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++            connection.send(content: Data(headers.utf8), completion: .contentProcessed { _ in connection.cancel() })
++            return
++        }
+         // Hold the missing file until the test cancels; no sleeps or timing races.
+         if method == "GET", path == "/test/cancel/resolve/main/weights.bin" {
+             pendingDownload.fulfill()
